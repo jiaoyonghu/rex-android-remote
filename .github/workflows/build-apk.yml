@@ -4,35 +4,45 @@ name: REx Android test APK
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Download REx source
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      - name: Check preinstalled Android SDK
+        shell: bash
+        run: |
+          echo "Android SDK: $ANDROID_SDK_ROOT"
+          test -f "$ANDROID_SDK_ROOT/platforms/android-36/android.jar"
+          test -d "$ANDROID_SDK_ROOT/build-tools/35.0.0"
+          echo "Android SDK 36 available"
 
-      - name: Install Android platform
-        run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
-
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
-      - name: Compile and sign debug APK
+      - name: Build REx APK
         run: gradle --no-daemon --stacktrace assembleDebug
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload REx APK
+        uses: actions/upload-artifact@v4
         with:
           name: REX-Android-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
