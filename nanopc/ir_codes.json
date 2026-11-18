@@ -1,0 +1,12 @@
+{
+  "protocol": "NEC extended address, 32 bit, LSB-first",
+  "carrier_hz": 38000,
+  "address_hex": "3B4C",
+  "byte_order": "0x4C,0x3B,command,command XOR 0xFF",
+  "commands": {
+    "WAKE":"10", "STAND":"11", "FORWARD":"12", "BACKWARD":"13",
+    "LEFT":"14", "RIGHT":"15", "TURN_LEFT":"16", "TURN_RIGHT":"17",
+    "STOP":"18", "DODGE":"19", "TURN_AROUND":"1A", "DISABLE":"1B", "ACTIVE":"1C"
+  },
+  "important": "No ROS2 motor bridge in this version. Robot IR receive driver currently absent."
+}
