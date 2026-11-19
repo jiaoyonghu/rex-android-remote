@@ -7,8 +7,8 @@ android {
         applicationId 'com.rex.remote'
         minSdk 29
         targetSdk 36
-        versionCode 4
-        versionName '0.4.0-bilingual'
+        versionCode 5
+        versionName '0.5.0-live-owner'
         ndk { abiFilters 'arm64-v8a' }
     }
     compileOptions {
@@ -23,12 +23,13 @@ dependencies {
     implementation 'net.java.dev.jna:jna:5.18.1@aar'
 }
 
-// Both official, permissively licensed Vosk small models are embedded in the
+// Both ASR models and a dedicated speaker embedding model are embedded in the
 // built APK. Neither model is fetched by the phone. Keep APK artifacts private
 // if you do not want the binary redistributed.
 def modelSpecs = [
     [name: 'vosk-model-small-cn-0.22', label: 'Mandarin'],
-    [name: 'vosk-model-small-en-us-0.15', label: 'English']
+    [name: 'vosk-model-small-en-us-0.15', label: 'English'],
+    [name: 'vosk-model-spk-0.4', label: 'Speaker embedding', speaker: true]
 ]
 def modelAssets = modelSpecs.collect { spec ->
     file("src/main/assets/${spec.name}.zip")
@@ -40,11 +41,15 @@ tasks.register('prepareRexBundledModels') {
             def zipDest = file("src/main/assets/${spec.name}.zip")
             def expectedModel = "${spec.name}/am/final.mdl"
             def expectedConf = "${spec.name}/conf/model.conf"
+            def requiredSpeaker = ['mfcc.conf','final.ext.raw','mean.vec','transform.mat']
+                .collect { "${spec.name}/${it}" }
             def archiveValid = { f ->
-                if (!f.exists() || f.length() < 20000000L) return false
+                if (!f.exists() || f.length() < (spec.speaker ? 5000000L : 20000000L)) return false
                 try {
                     def z = new java.util.zip.ZipFile(f)
                     try {
+                        if (spec.speaker)
+                            return requiredSpeaker.every { z.getEntry(it) != null }
                         return z.getEntry(expectedModel) != null &&
                             z.getEntry(expectedConf) != null
                     } finally { z.close() }

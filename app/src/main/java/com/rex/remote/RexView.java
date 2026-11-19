@@ -16,17 +16,18 @@ import java.util.ArrayList;
 import java.util.Random;
 
 /**
- * REx v0.4 dual particle volumes: large filaments + small dense inner kernel.
+ * REx v0.5 dual particle volumes: large filaments + small dense inner kernel.
  * Neither is a geometric sphere/ring/disc; both have irregular radial surfaces.
  * Sleep: both keep particle-relative positions rigid while globally rotating.
  * Awake: independent particle motion and distinct core/outer trajectories.
- * Voice energy affects deformation only after offline ASR sees speech hypotheses.
+ * Voice energy comes directly from live microphone PCM, independent of ASR results.
  */
 public final class RexView extends View {
     public interface Actions {
         void onSend(RexCommand command);
         void onStartVoice();
         void onStopVoice();
+        void onEnrollVoice();
     }
     private static final int W=360,H=780;
     private final Actions actions;
@@ -39,17 +40,19 @@ public final class RexView extends View {
     private final float[] corePx=new float[1248];
     private final float[] corePy=new float[1248];
     private boolean manual;
-    private String message="v0.4 · 中英双语离线监听 · 红外仅联调";
+    private String message="v0.5 · 中英双语 + 声纹录入 · 语音红外未授权";
     private String irStatus="正在检测 IR";
-    private String lastText="请说 Rex / 瑞克斯，再用中文或 English 发出命令";
+    private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
     private String commandText="";
+    private String ownerStatus="尚未录入声纹";
+    private int enrollCount;
+    private boolean awake;
     private float voiceLevel;
     private float activeBlend;
     private boolean speaking;
     private boolean voiceStarted;
-    private long wakeUntilMs;
-    private long lastTapMs;
+        private long lastTapMs;
     private long downMs;
     private int taps;
     private final long startedAt=SystemClock.elapsedRealtime();
@@ -125,20 +128,30 @@ public final class RexView extends View {
     }
     public void setIrStatus(String value){irStatus=value;invalidate();}
     public void setMessage(String value){message=value;invalidate();}
-    public void setVoiceStopped(){voiceStarted=false;voiceStatus="语音监听已关闭";speaking=false;invalidate();}
-    public void onVoice(String text,String command,boolean wake,float level,String status,boolean speakingNow){
+    public void setVoiceStopped(){
+        voiceStarted=false;voiceStatus="语音监听已关闭";speaking=false;awake=false;invalidate();
+    }
+    public void onVoice(String text,String partial,String command,boolean wakeEvent,
+                        boolean awakeNow,float level,String status,boolean speakingNow,
+                        String ownerNow,int voiceSamples){
         voiceStarted=true;
         if(status!=null)voiceStatus=status;
+        if(ownerNow!=null)ownerStatus=ownerNow;
+        enrollCount=voiceSamples;
+        awake=awakeNow;
         speaking=speakingNow;
-        if(wake){ manual=false;wakeUntilMs=SystemClock.elapsedRealtime()+15000; }
+        if(wakeEvent) manual=false; // wake from manual mode always returns to REx
         if(text!=null){
             lastText=text;
-            if(command!=null)commandText="已识别 "+command+" · 声纹未认证，未发射红外";
-            else if(wake)commandText="REx 已唤醒";
-            else commandText="没有授权运动指令";
+            if("SLEEP".equals(command))commandText="已听到『睡觉』 · 回待机";
+            else if(command!=null)commandText="识别 "+command+" · 未授权发射语音红外";
+            else if(wakeEvent)commandText="REx 已唤醒 · 持续待命";
+            else commandText="非白名单指令 · 不执行";
+        }else if(partial!=null && !partial.isEmpty()){
+            lastText="实时（未确认）："+partial;
         }
+        // Realtime samples arrive even BEFORE partial/final recognition output.
         if(level>0)voiceLevel=Math.max(voiceLevel,level);
-        else if(speakingNow) voiceLevel=Math.max(voiceLevel,.28f);
         invalidate();
     }
     private void solid(int color){paint.setShader(null);paint.setStyle(Paint.Style.FILL);paint.setColor(color);}
@@ -212,7 +225,7 @@ public final class RexView extends View {
             float outline=1f + (inner?.14f:.11f)*lobes + (inner?.09f:.055f)*ridges;
             float living=active*(inner?.18f:.12f)*(float)Math.sin(
                 seconds*(inner?4.1f:2.2f)+a.twist*2f+phi*9f);
-            float speechWave=energy*active*(inner?.36f:.42f)*
+            float speechWave=energy*active*(inner?.52f:.65f)*
                 (float)Math.sin(waveClock+phi*(inner?15f:10f)+a.phase*2.3f);
             float rr=radius*a.spread*(outline+living+speechWave);
             // 2.5D projection without a rendered circular core.
@@ -257,8 +270,7 @@ public final class RexView extends View {
         }
     }
     private void filaments(Canvas c,float seconds){
-        long now=SystemClock.elapsedRealtime();
-        float target=now<wakeUntilMs?1f:0f;
+        float target=awake?1f:0f;
         activeBlend+=(target-activeBlend)*.08f;
         if(Math.abs(activeBlend-target)<.001f)activeBlend=target;
         float active=activeBlend;
@@ -274,20 +286,25 @@ public final class RexView extends View {
         renderVolume(c,seconds,false,cx,cy,shellRadius,active,energy);
         renderVolume(c,seconds,true,cx,cy,coreRadius,active,energy);
         center(c,"R E X",cx,552,22,0xFFFFD9E5,true);
-        center(c,target>.5f?"AWAKE / OFFLINE RECOGNITION":"DORMANT / ROTATING FIELDS",
+        center(c,target>.5f?"AWAKE / UNTIL 睡觉":"DORMANT / ROTATING FIELDS",
             cx,574,10,target>.5f?0xFFFF9DB4:0xFFAE7B87,false);
         if(active>.1f && energy>.06f)
-            center(c,"VOICE FIELD  "+Math.round(energy*100)+"%",
+            center(c,"LIVE MIC  "+Math.round(energy*100)+"%",
                 cx,590,8,0xFFFF9EBE,false);
     }
     private void voicePanel(Canvas c){
-        box(c,20,596,340,661,0xA3241825,11);
-        text(c,shortText(voiceStatus,40),28,615,10,0xFFF1BAC8,false);
-        text(c,shortText(lastText,40),28,636,10,0xFFCFA1B2,false);
-        text(c,shortText(commandText,39),28,653,9,0xFFFF8FA7,false);
+        // Right of REX: voice-profile button. Left of REX stays free for triple tap.
+        box(c,246,526,336,578,0xB02C1A2C,9);
+        center(c,"声纹录入",291,548,12,0xFFFFC1D2,true);
+        center(c,"录入 / 完成",291,565,8,0xFFD59DAB,false);
+        box(c,20,596,340,665,0xA3241825,11);
+        text(c,shortText(voiceStatus,38),28,609,9,0xFFF1BAC8,false);
+        text(c,shortText(lastText,39),28,625,9,0xFFFFC0CE,false);
+        text(c,shortText(ownerStatus,39),28,642,9,0xFFEFA2B7,false);
+        text(c,shortText(commandText,39),28,657,8,0xFFFF8FA7,false);
         box(c,20,668,340,699,0xA74B1F30,11);
-        center(c,voiceStarted?"本地语音运行中 / 长按关闭":"点击启动 APK 内置离线识别",180,688,12,0xFFF8D4DF,true);
-        center(c,"REX 左侧空白处三击 → 按键模式",180,697,7,0xFF8F6D7B,false);
+        center(c,voiceStarted?"离线语音运行中 / 长按关闭":"点击启动内置离线语音",180,687,12,0xFFF8D4DF,true);
+        center(c,"REX 左侧三击切换 / 右侧声纹录入",180,697,7,0xFF8F6D7B,false);
     }
     private void drawControls(Canvas c){
         for(TouchButton b:controls){
@@ -332,6 +349,9 @@ public final class RexView extends View {
                 return true;
             }
             boolean longPress=now-downMs>1100;
+            if(!manual && x>=243 && x<=339 && y>=522 && y<=585){
+                actions.onEnrollVoice();return true;
+            }
             if(!manual && x>20 && x<340 && y>668 && y<699){
                 if(longPress)actions.onStopVoice();else actions.onStartVoice();
                 return true;
