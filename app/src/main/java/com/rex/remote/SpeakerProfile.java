@@ -39,7 +39,11 @@ public final class SpeakerProfile {
         float[] avg=SpeakerMath.centroid(samples);
         if(avg==null)return false;
         JSONArray js=new JSONArray();
-        for(float x:avg)js.put(x);
+        try {
+            for (float x : avg) js.put((double) x);
+        } catch (org.json.JSONException e) {
+            return false;
+        }
         boolean saved=prefs.edit().putString(VECTOR,js.toString()).commit();
         if(saved){samples.clear();enrolling=false;}
         return saved;
