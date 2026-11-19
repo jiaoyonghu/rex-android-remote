@@ -16,7 +16,7 @@ import java.util.ArrayList;
 import java.util.Random;
 
 /**
- * REx v0.5 dual particle volumes: large filaments + small dense inner kernel.
+ * REx dual particle volumes: large filaments + small dense inner kernel.
  * Neither is a geometric sphere/ring/disc; both have irregular radial surfaces.
  * Sleep: both keep particle-relative positions rigid while globally rotating.
  * Awake: independent particle motion and distinct core/outer trajectories.
@@ -31,6 +31,11 @@ public final class RexView extends View {
         void onCaptureVoice(int step);
         void onCompleteVoice(int step);
         void onCancelVoiceEnrollment();
+        void onOpenCommandTraining();
+        void onSelectCommandPhrase(int index);
+        void onCaptureCommandPhrase(int index);
+        void onClearCommandPhrase(int index);
+        void onFinishCommandTraining();
     }
     private static final int W=360,H=780;
     private final Actions actions;
@@ -42,13 +47,16 @@ public final class RexView extends View {
     private final float[] py=new float[1940];
     private final float[] corePx=new float[1248];
     private final float[] corePy=new float[1248];
-    private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2;
+    private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2,PAGE_TRAIN=3;
     private int page=PAGE_VOICE;
+    private int trainIndex,trainCount;
+    private boolean trainCapturing;
+    private String trainInfo="点击采集，为这条固定指令录音 3 至 5 次";
     private int enrollStep;
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v0.6 · 实时人声门控 + 第三页声纹录入 · 语音红外未授权";
+    private String message="v0.7 · 每条口令个性化录音训练 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -137,6 +145,16 @@ public final class RexView extends View {
     }
     public void setIrStatus(String value){irStatus=value;invalidate();}
     public void setMessage(String value){message=value;invalidate();}
+    public void onTraining(int index,int count,String info,String event){
+        trainIndex=Math.max(0,Math.min(CommandPhrases.count()-1,index));
+        trainCount=count;
+        if(info!=null)trainInfo=info;
+        if("TRAIN_LISTEN".equals(event))trainCapturing=true;
+        if("TRAIN_OK".equals(event)||"TRAIN_FAIL".equals(event)||
+            "TRAIN_EXIT".equals(event)||"TRAIN_CLEARED".equals(event)||
+            "TRAIN_SELECTED".equals(event))trainCapturing=false;
+        invalidate();
+    }
     public void setVoiceStopped(){
         voiceStarted=false;voiceStatus="语音监听已关闭";speaking=false;awake=false;invalidate();
     }
@@ -154,7 +172,7 @@ public final class RexView extends View {
         if(currentStep>=EnrollmentPrompts.count())enrollmentDone=true;
         awake=awakeNow;
         speaking=speakingNow;
-        if(wakeEvent && page!=PAGE_OWNER) page=PAGE_VOICE; // never interrupt enrollment
+        if(wakeEvent && page!=PAGE_OWNER && page!=PAGE_TRAIN) page=PAGE_VOICE; // never interrupt enrollment
         if(text!=null){
             lastText=text;
             if("SLEEP".equals(command))commandText="已听到『睡觉』 · 回待机";
@@ -199,7 +217,8 @@ public final class RexView extends View {
         line(c,18,704,342,704,0x55485A70,.7f);
         text(c,"R E X",25,48,27,0xFFFFDCE0,true);
         text(c,page==PAGE_MANUAL?"TACTICAL MANUAL":
-            (page==PAGE_OWNER?"VOICEPRINT / GUIDED ENROLLMENT":"VOICE REACTIVE / PARTICLE FIELD"),
+            (page==PAGE_OWNER?"VOICEPRINT / GUIDED ENROLLMENT":
+            (page==PAGE_TRAIN?"PERSONALIZED SPEECH COMMANDS":"VOICE REACTIVE / PARTICLE FIELD")),
             25,68,10,0xFFC06A7B,false);
         text(c,"ONEPLUS ACE 3V  ·  ANDROID 16",25,87,9,0xFF8A6674,false);
         box(c,18,115,342,150,0x6C211B27,10);
@@ -365,11 +384,44 @@ public final class RexView extends View {
         // Matching left/right triple-tap areas remain blank (y = 532..582).
         center(c,"左侧三击按键",85,598,9,0xFFC79EAE,false);
         center(c,"右侧三击声纹",278,598,9,0xFFC79EAE,false);
-        box(c,20,625,340,697,0x9F251A27,11);
-        text(c,shortText(voiceStatus,39),30,644,10,0xFFF0B8CA,false);
-        text(c,shortText(lastText,37),30,661,10,0xFFFFC5D4,false);
-        text(c,shortText(ownerStatus,38),30,678,9,0xFFD2A2B7,false);
-        center(c,"整句核对 + 有效声纹才算成功 · 不发红外",180,692,8,0xFF987886,false);
+        box(c,20,605,340,635,0x9D563046,10);
+        center(c,"进入固定口令个性化训练  →",180,625,11,0xFFFFC5D4,true);
+        box(c,20,640,340,697,0x9F251A27,11);
+        text(c,shortText(voiceStatus,39),30,658,9,0xFFF0B8CA,false);
+        text(c,shortText(lastText,37),30,675,9,0xFFFFC5D4,false);
+        text(c,shortText(ownerStatus,38),30,690,8,0xFFD2A2B7,false);
+    }
+    private void drawCommandTraining(Canvas c){
+        center(c,"个性化口令训练 / COMMAND TRAINING",180,187,15,0xFFFFC6D7,true);
+        center(c,"训练录音不重训神经网络 · 只学习你的原定口令",180,211,9,0xFFCDA8B9,false);
+        box(c,20,231,340,300,0xAD2C1C2C,12);
+        center(c,"第 "+(trainIndex+1)+" / "+CommandPhrases.count()+" 条口令",180,250,10,0xFFC9AAB7,false);
+        center(c,CommandPhrases.at(trainIndex),180,276,
+            CommandPhrases.at(trainIndex).length()>9?16:22,0xFFFFD9E6,true);
+        box(c,20,310,172,361,0xA6382335,10);
+        center(c,"← 上一条",96,343,13,0xFFFFCDDC,true);
+        box(c,188,310,340,361,0xA6382335,10);
+        center(c,"下一条 →",264,343,13,0xFFFFCDDC,true);
+        center(c,"已采集 "+trainCount+" / 5 次  ·  至少 3 次启用辅助识别",180,385,10,
+            trainCount>=3?0xFFFFBED0:0xFFB6A2AF,false);
+        box(c,20,400,340,451,trainCount>=5?0x68372233:0xBB5A2842,12);
+        center(c,trainCapturing?"正在采集 · 请朗读后停顿":"点击采集本条口令",180,431,15,0xFFFFDEE9,true);
+        box(c,20,465,172,511,0xA2362432,10);
+        center(c,"清除本条样本",96,493,11,0xFFFFBCC9,false);
+        box(c,188,465,340,511,0xA2362432,10);
+        center(c,"返回声纹页",264,493,11,0xFFFFBCC9,false);
+        // Keep original symmetrical empty triple-tap hot areas (526..584).
+        center(c,"左侧三击按键 / 右侧三击声纹",180,603,9,0xFFC69EAF,false);
+        box(c,20,619,340,697,0xA1271B2A,11);
+        text(c,shortText(trainInfo,42),28,641,10,0xFFFFCBDA,false);
+        text(c,shortText(voiceStatus,42),28,658,9,0xFFC8A5B2,false);
+        text(c,"拒绝相似口令的模糊猜测 · 未授权发射语音红外",28,675,9,0xFFD9AFC1,false);
+        text(c,"每次只念一条；失败可以重采；录过的样本保存在本机",28,690,8,0xFFAC8796,false);
+    }
+    public void openCommandTraining(){
+        page=PAGE_TRAIN;trainIndex=0;trainCount=0;trainCapturing=false;
+        trainInfo="请选择口令，点击采集并朗读；至少录 3 次";
+        invalidate();
     }
     public void openEnrollment(){
         page=PAGE_OWNER;enrollStep=0;enrollReady=false;enrollmentDone=false;
@@ -384,6 +436,7 @@ public final class RexView extends View {
         float t=(SystemClock.elapsedRealtime()-startedAt)/1000f;
         if(page==PAGE_MANUAL)drawControls(raw);
         else if(page==PAGE_OWNER)drawEnrollment(raw);
+        else if(page==PAGE_TRAIN)drawCommandTraining(raw);
         else {filaments(raw,t);voicePanel(raw);}
         raw.restoreToCount(count);
         voiceLevel*=.91f;
@@ -403,6 +456,7 @@ public final class RexView extends View {
                 if(leftTaps>=3){
                     leftTaps=0;
                     if(page==PAGE_OWNER)actions.onCancelVoiceEnrollment();
+                    if(page==PAGE_TRAIN)actions.onFinishCommandTraining();
                     page=(page==PAGE_MANUAL)?PAGE_VOICE:PAGE_MANUAL;
                     invalidate();
                 }
@@ -413,13 +467,38 @@ public final class RexView extends View {
                 lastRightTapMs=now;leftTaps=0;
                 if(rightTaps>=3){
                     rightTaps=0;
-                    if(page==PAGE_OWNER){actions.onCancelVoiceEnrollment();page=PAGE_VOICE;}
-                    else{openEnrollment();actions.onEnrollVoice();}
+                    if(page==PAGE_OWNER){
+                        actions.onCancelVoiceEnrollment();page=PAGE_VOICE;
+                    }else if(page==PAGE_TRAIN){
+                        actions.onFinishCommandTraining();openEnrollment();actions.onEnrollVoice();
+                    }else{
+                        openEnrollment();actions.onEnrollVoice();
+                    }
                     invalidate();
                 }
                 return true;
             }
             boolean longPress=now-downMs>1100;
+            if(page==PAGE_TRAIN){
+                if(y>=310 && y<=361){
+                    trainIndex=Math.max(0,Math.min(CommandPhrases.count()-1,
+                        trainIndex+(x<180?-1:1)));
+                    trainCount=0;trainCapturing=false;
+                    actions.onSelectCommandPhrase(trainIndex);invalidate();return true;
+                }
+                if(y>=400 && y<=451){
+                    if(trainCount<5 && !trainCapturing){
+                        trainCapturing=true;actions.onCaptureCommandPhrase(trainIndex);
+                    }
+                    invalidate();return true;
+                }
+                if(y>=465 && y<=511){
+                    if(x<180){actions.onClearCommandPhrase(trainIndex);}
+                    else{actions.onFinishCommandTraining();openEnrollment();actions.onEnrollVoice();}
+                    invalidate();return true;
+                }
+                return true;
+            }
             if(page==PAGE_OWNER){
                 if(y>=377 && y<=442){
                     if(x>=20 && x<=172 && !enrollReady && !enrollmentDone)
@@ -427,6 +506,10 @@ public final class RexView extends View {
                     if(x>=188 && x<=340 && enrollReady && !enrollmentDone)
                         actions.onCompleteVoice(enrollStep);
                     return true;
+                }
+                if(y>=605 && y<=635){
+                    actions.onCancelVoiceEnrollment();
+                    openCommandTraining();actions.onOpenCommandTraining();return true;
                 }
                 if(y>=482 && y<=521){
                     if(x>=20 && x<=172){actions.onCancelVoiceEnrollment();openEnrollment();actions.onEnrollVoice();}

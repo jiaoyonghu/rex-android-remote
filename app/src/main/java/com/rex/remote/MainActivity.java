@@ -20,6 +20,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
     private RexView view;
     private boolean registered;
     private boolean enrollmentAfterPermission;
+    private boolean trainingAfterPermission;
     private final BroadcastReceiver voiceEvents=new BroadcastReceiver() {
         @Override public void onReceive(Context context,Intent i) {
             if (view==null) return;
@@ -36,6 +37,16 @@ public final class MainActivity extends Activity implements RexView.Actions {
                 i.getIntExtra(VoiceService.EXTRA_ENROLL_STEP,0),
                 i.getBooleanExtra(VoiceService.EXTRA_ENROLL_READY,false),
                 i.getBooleanExtra(VoiceService.EXTRA_ENROLL_CAPTURING,false));
+            String trainEvent=i.getStringExtra(VoiceService.EXTRA_TRAIN_EVENT);
+            view.onTraining(i.getIntExtra(VoiceService.EXTRA_TRAIN_INDEX,0),
+                i.getIntExtra(VoiceService.EXTRA_TRAIN_COUNT,0),
+                i.getStringExtra(VoiceService.EXTRA_TRAIN_INFO),trainEvent);
+            if("TRAIN_FAIL".equals(trainEvent)){
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("指令采集失败")
+                    .setMessage(i.getStringExtra(VoiceService.EXTRA_TRAIN_INFO))
+                    .setPositiveButton("重新采集",null).show();
+            }
             String enrollmentEvent=i.getStringExtra(VoiceService.EXTRA_ENROLL_EVENT);
             if("CAPTURE_FAIL".equals(enrollmentEvent)){
                 new AlertDialog.Builder(MainActivity.this)
@@ -84,11 +95,12 @@ public final class MainActivity extends Activity implements RexView.Actions {
         super.onRequestPermissionsResult(request,permissions,results);
         if(request!=MIC_REQUEST) return;
         if(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED){
-            if(enrollmentAfterPermission) {
+            if(trainingAfterPermission){trainingAfterPermission=false;openTraining();}
+            else if(enrollmentAfterPermission) {
                 enrollmentAfterPermission=false;beginEnrollment();
             }else startVoice();
         }else{
-            enrollmentAfterPermission=false;
+            enrollmentAfterPermission=false;trainingAfterPermission=false;
             view.setMessage("麦克风权限未授权，语音监听未启动");
         }
     }
@@ -134,6 +146,36 @@ public final class MainActivity extends Activity implements RexView.Actions {
     }
     @Override public void onCancelVoiceEnrollment(){
         sendEnrollAction(VoiceService.ACTION_ENROLL_CANCEL,0);
+    }
+    @Override public void onOpenCommandTraining(){
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){
+            trainingAfterPermission=true;
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},MIC_REQUEST);
+        }else openTraining();
+    }
+    private void openTraining(){sendTrainingAction(VoiceService.ACTION_TRAIN_BEGIN,0,true);}
+    private void sendTrainingAction(String action,int phrase,boolean mayStart){
+        try{
+            Intent intent=new Intent(this,VoiceService.class).setAction(action);
+            intent.putExtra(VoiceService.EXTRA_TRAIN_INDEX,phrase);
+            if(mayStart)startForegroundService(intent);else startService(intent);
+        }catch(Exception e){view.setMessage("指令训练操作失败："+e.getClass().getSimpleName());}
+    }
+    @Override public void onSelectCommandPhrase(int index){
+        sendTrainingAction(VoiceService.ACTION_TRAIN_SELECT,index,false);
+    }
+    @Override public void onCaptureCommandPhrase(int index){
+        sendTrainingAction(VoiceService.ACTION_TRAIN_CAPTURE,index,false);
+    }
+    @Override public void onClearCommandPhrase(int index){
+        new AlertDialog.Builder(this).setTitle("清除这条口令的训练样本？")
+            .setMessage("将删除『"+CommandPhrases.at(index)+"』的所有本地声学模板，不影响其他口令。")
+            .setNegativeButton("取消",null)
+            .setPositiveButton("清除",(d,w)->sendTrainingAction(VoiceService.ACTION_TRAIN_CLEAR,index,false))
+            .show();
+    }
+    @Override public void onFinishCommandTraining(){
+        sendTrainingAction(VoiceService.ACTION_TRAIN_END,0,false);
     }
     @Override public void onSend(RexCommand cmd) {
         if(cmd==RexCommand.SLEEP||cmd==RexCommand.WAKE)return;

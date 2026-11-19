@@ -32,13 +32,22 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * REx v0.6: in-app bilingual Vosk ASR, speech-likeness-gated live visuals,
+ * REx v0.7: in-app bilingual Vosk ASR + per-phrase learned acoustic templates,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
 public final class VoiceService extends Service {
     public static final String ACTION_EVENT="com.rex.remote.VOICE_EVENT";
     public static final String ACTION_STOP="com.rex.remote.STOP_VOICE";
+    public static final String ACTION_TRAIN_BEGIN="com.rex.remote.TRAIN_BEGIN";
+    public static final String ACTION_TRAIN_SELECT="com.rex.remote.TRAIN_SELECT";
+    public static final String ACTION_TRAIN_CAPTURE="com.rex.remote.TRAIN_CAPTURE";
+    public static final String ACTION_TRAIN_CLEAR="com.rex.remote.TRAIN_CLEAR";
+    public static final String ACTION_TRAIN_END="com.rex.remote.TRAIN_END";
+    public static final String EXTRA_TRAIN_INDEX="train_index";
+    public static final String EXTRA_TRAIN_COUNT="train_count";
+    public static final String EXTRA_TRAIN_EVENT="train_event";
+    public static final String EXTRA_TRAIN_INFO="train_info";
     public static final String ACTION_ENROLL_BEGIN="com.rex.remote.ENROLL_BEGIN";
     public static final String ACTION_ENROLL_CAPTURE="com.rex.remote.ENROLL_CAPTURE";
     public static final String ACTION_ENROLL_NEXT="com.rex.remote.ENROLL_NEXT";
@@ -60,7 +69,7 @@ public final class VoiceService extends Service {
     public static final String EXTRA_ENROLL_CAPTURING="enroll_capturing";
     public static final String EXTRA_ENROLL_EVENT="enroll_event";
 
-    private static final String CHANNEL="rex_offline_voice_v6";
+    private static final String CHANNEL="rex_offline_voice_v7";
     private static final String TAG="RExOfflineVoice";
     private static final int SAMPLE_RATE=16000;
     private static final String ZH_MODEL_ZIP="vosk-model-small-cn-0.22.zip";
@@ -79,6 +88,15 @@ public final class VoiceService extends Service {
     private volatile AudioRecord recording;
     private Thread worker;
     private SpeakerProfile profile;
+    private CommandTemplateStore templates;
+    private volatile boolean trainingMode,trainingArmed;
+    private volatile int trainingPhrase;
+    private volatile long trainingDeadline;
+    private volatile String trainingInfo="当前口令未训练 · 至少采集 3 次";
+    private final ArrayBlockingQueue<CommandClip> commandClips=new ArrayBlockingQueue<>(5);
+    private long lastAsrMatchMs;
+    private CommandTemplateStore.Result pendingTemplate;
+    private long pendingTemplateAt;
     private long lastRealtimeBroadcastMs;
     private volatile long lastVoiceOnsetMs;
     private long lastFinalMs;
@@ -92,7 +110,7 @@ public final class VoiceService extends Service {
     private static final long CAPTURE_TIMEOUT_MS=19000;
     private String lastPartialSent="";
 
-    @Override public void onCreate(){super.onCreate();profile=new SpeakerProfile(this);
+    @Override public void onCreate(){super.onCreate();profile=new SpeakerProfile(this);templates=new CommandTemplateStore(this);
         if(profile.hasProfile())ownerStatus="已录入声纹 · 待验证";
     }
 
@@ -100,6 +118,46 @@ public final class VoiceService extends Service {
         String action=intent==null?"":intent.getAction();
         if(ACTION_STOP.equals(action)){stopSelf();return START_NOT_STICKY;}
         int requestedStep=intent==null?0:intent.getIntExtra(EXTRA_ENROLL_STEP,0);
+        int requestedPhrase=intent==null?0:intent.getIntExtra(EXTRA_TRAIN_INDEX,0);
+        if(ACTION_TRAIN_BEGIN.equals(action)||ACTION_TRAIN_SELECT.equals(action)){
+            trainingMode=true;trainingArmed=false;
+            commandClips.clear();pendingTemplate=null;
+            trainingPhrase=Math.max(0,Math.min(CommandPhrases.count()-1,requestedPhrase));
+            trainingInfo="『"+CommandPhrases.at(trainingPhrase)+"』已录 "
+                +templates.count(trainingPhrase)+" / 5 次 · 至少 3 次";
+            status="指令个性化训练 · 录音仅保留声学特征，不存原始音频";
+            publishTraining("TRAIN_SELECTED");
+        }
+        if(ACTION_TRAIN_CAPTURE.equals(action)){
+            if(!trainingMode || requestedPhrase!=trainingPhrase){
+                trainingInfo="提示词已改变，请重新选择当前指令";
+                publishTraining("TRAIN_FAIL");
+            }else if(templates.count(trainingPhrase)>=CommandTemplateStore.MAX_TAKES){
+                trainingInfo="本条已采集 5 次，请切换指令或清除后重录";
+                publishTraining("TRAIN_FAIL");
+            }else{
+                trainingArmed=true;
+                trainingDeadline=SystemClock.elapsedRealtime()+12000;
+                trainingInfo="正在采集『"+CommandPhrases.at(trainingPhrase)+"』，请说一次并停顿";
+                publishTraining("TRAIN_LISTEN");
+            }
+            return START_NOT_STICKY;
+        }
+        if(ACTION_TRAIN_CLEAR.equals(action)){
+            if(trainingMode && requestedPhrase==trainingPhrase){
+                templates.clear(trainingPhrase);trainingArmed=false;
+                trainingInfo="本条已清空，请点击『采集』重新朗读";
+                publishTraining("TRAIN_CLEARED");
+            }
+            return START_NOT_STICKY;
+        }
+        if(ACTION_TRAIN_END.equals(action)){
+            trainingMode=false;trainingArmed=false;
+            commandClips.clear();pendingTemplate=null;
+            trainingInfo="已退出指令训练 · 已录样本保存在本机";
+            publishTraining("TRAIN_EXIT");
+            return START_NOT_STICKY;
+        }
         if(ACTION_ENROLL_CAPTURE.equals(action)){
             synchronized(enrollLock){
                 if(profile.isEnrolling() && requestedStep==enrollStep && !enrollReady){
@@ -184,11 +242,59 @@ public final class VoiceService extends Service {
         try {startForeground(1001,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);}
         catch(Exception e){status="麦克风服务启动失败："+e.getClass().getSimpleName();
             publish(null,null,null,false,0f);stopSelf();return START_NOT_STICKY;}
-        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v6");worker.start();}
+        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v7");worker.start();}
         publish(null,null,null,false,0f);
         return START_NOT_STICKY;
     }
     private void updateStatus(String value){status=value;publish(null,null,null,false,0f);}
+    private void publishTraining(String event){
+        publish(null,null,null,false,0f,null,event);
+    }
+    private static final class CommandClip {
+        final short[] pcm; final int phrase;
+        CommandClip(short[] pcm,int phrase){this.pcm=pcm;this.phrase=phrase;}
+    }
+    private void handleClip(CommandClip clip){
+        if(clip.phrase>=0){
+            String failure=templates.add(clip.phrase,clip.pcm);
+            if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
+            else{
+                int n=templates.count(clip.phrase);
+                trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』采集成功 " + n
+                    +"/5" + (n>=3 ? " · 已可参与训练辅助识别" : " · 还需至少 "+(3-n)+" 次");
+                publishTraining("TRAIN_OK");
+            }
+        }else if(!trainingMode){
+            CommandTemplateStore.Result result=templates.match(clip.pcm);
+            if(result.accepted()){
+                pendingTemplate=result;
+                pendingTemplateAt=SystemClock.elapsedRealtime();
+            }
+        }
+    }
+    private void handlePendingTemplate(){
+        if(pendingTemplate==null || trainingMode)return;
+        long now=SystemClock.elapsedRealtime();
+        if(now-pendingTemplateAt<1150)return; // let CN+EN ASR finish first
+        CommandTemplateStore.Result result=pendingTemplate;
+        pendingTemplate=null;
+        if(now-lastAsrMatchMs<1500)return;
+        RexCommand c=CommandPhrases.command(result.index);
+        if(c==null)return;
+        if(c==RexCommand.WAKE){awake=true;
+            status="训练模板识别唤醒『"+CommandPhrases.at(result.index)+"』 · 持续唤醒直到睡觉";
+            publish("个性化训练命中："+CommandPhrases.at(result.index),null,null,true,0f);
+        }else if(c==RexCommand.SLEEP){
+            if(!awake)return;
+            awake=false;lastOwnerVerifiedMs=0;
+            status="训练模板识别『睡觉』 · 返回待机";
+            publish("个性化训练命中：睡觉",null,c,false,0f);
+        }else if(awake){
+            status="训练模板辅助识别『"+CommandPhrases.at(result.index)
+                +"』 · 仅界面显示，语音红外未授权";
+            publish("个性化训练命中："+CommandPhrases.at(result.index),null,c,false,0f);
+        }
+    }
 
     /** Copies one prepackaged Vosk ZIP into app-private storage on first use. */
     private File unpackBundledModel(String zipName, String folder, String language) throws Exception {
@@ -300,7 +406,10 @@ public final class VoiceService extends Service {
                     long pendingSince=0;
                     String latestZhPartial="",latestEnPartial="";
                     while(running){
-                        short[] samples=audioQueue.poll(350,TimeUnit.MILLISECONDS);
+                        CommandClip newClip;
+                        while((newClip=commandClips.poll())!=null)handleClip(newClip);
+                        handlePendingTemplate();
+                        short[] samples=audioQueue.poll(200,TimeUnit.MILLISECONDS);
                         if(!running)break;
                         if(samples==null)continue;
                         int count=samples.length;
@@ -351,6 +460,8 @@ public final class VoiceService extends Service {
     /** Real-time PCM thread: samples + publishes level BEFORE any ASR decoding. */
     private void capturePcm(AudioRecord mic,ArrayBlockingQueue<short[]> queue){
         short[] reusable=new short[800]; // 50ms, 16kHz mono
+        CommandAudioSegmenter segmenter=new CommandAudioSegmenter();
+        CommandActivityGate commandGate=new CommandActivityGate();
         try{
             while(running){
                 int count=mic.read(reusable,0,reusable.length,AudioRecord.READ_BLOCKING);
@@ -362,6 +473,27 @@ public final class VoiceService extends Service {
                 speaking=activityGate.isActive();
                 long now=SystemClock.elapsedRealtime();
                 if(!wasSpeaking && speaking)lastVoiceOnsetMs=now;
+                if(trainingArmed && now>trainingDeadline){
+                    trainingArmed=false;trainingInfo="采集超时：没有完成一次有效的朗读，请重试";
+                    publishTraining("TRAIN_FAIL");
+                }
+                // More sensitive command capture does NOT drive the visible
+                // particle field. ASR and template matching may reject it.
+                boolean commandActivity=commandGate.accept(reusable,count,speaking);
+                short[] utterance=segmenter.accept(reusable,count,commandActivity);
+                if(utterance!=null){
+                    int phrase=-1;
+                    if(trainingMode){
+                        if(trainingArmed){phrase=trainingPhrase;trainingArmed=false;}
+                        else utterance=null;
+                    }
+                    if(utterance!=null){
+                        CommandClip clip=new CommandClip(utterance,phrase);
+                        if(!commandClips.offer(clip)){
+                            commandClips.poll();commandClips.offer(clip);
+                        }
+                    }
+                }
                 synchronized(enrollLock){
                     if(profile.isEnrolling() && enrollArmed && now>=enrollDeadline){
                         enrollArmed=false;
@@ -412,6 +544,7 @@ public final class VoiceService extends Service {
         catch(Exception e){return "";}
     }
     private void consumePair(String zhText,String enText,SpeakerEvidence zhSpk,SpeakerEvidence enSpk){
+        if(trainingMode)return;
         long now=SystemClock.elapsedRealtime();
         String fingerprint=RexCommand.norm(zhText)+"|"+RexCommand.norm(enText);
         if(fingerprint.equals("|") ||
@@ -466,6 +599,7 @@ public final class VoiceService extends Service {
             awake=true; wakeEvent=true;
         }
         RexCommand cmd=match.command;
+        if(match.woke||cmd!=null){lastAsrMatchMs=now;pendingTemplate=null;}
         if(cmd==RexCommand.SLEEP){awake=false;lastOwnerVerifiedMs=0;
             status="已听到『睡觉』 · 智能体进入待机（麦克风继续监听）";
         }else if(match.woke){status="REx 已唤醒 · 永不自动休眠 · 说『睡觉』休眠";}
@@ -479,15 +613,23 @@ public final class VoiceService extends Service {
     }
     private void publish(String finalText,String partial,RexCommand command,
                          boolean wakeEvent,float realtimeLevel){
-        publish(finalText,partial,command,wakeEvent,realtimeLevel,null);
+        publish(finalText,partial,command,wakeEvent,realtimeLevel,null,null);
     }
     private void publish(String finalText,String partial,RexCommand command,
                          boolean wakeEvent,float realtimeLevel,String enrollEvent){
+        publish(finalText,partial,command,wakeEvent,realtimeLevel,enrollEvent,null);
+    }
+    private void publish(String finalText,String partial,RexCommand command,
+                         boolean wakeEvent,float realtimeLevel,String enrollEvent,String trainEvent){
         Intent i=new Intent(ACTION_EVENT).setPackage(getPackageName());
         if(finalText!=null)i.putExtra(EXTRA_TEXT,finalText);
         if(partial!=null)i.putExtra(EXTRA_PARTIAL,partial);
         if(command!=null)i.putExtra(EXTRA_COMMAND,command.name());
         if(enrollEvent!=null)i.putExtra(EXTRA_ENROLL_EVENT,enrollEvent);
+        if(trainEvent!=null)i.putExtra(EXTRA_TRAIN_EVENT,trainEvent);
+        i.putExtra(EXTRA_TRAIN_INDEX,trainingPhrase);
+        i.putExtra(EXTRA_TRAIN_COUNT,templates.count(trainingPhrase));
+        i.putExtra(EXTRA_TRAIN_INFO,trainingInfo);
         i.putExtra(EXTRA_WAKE,wakeEvent);
         i.putExtra(EXTRA_AWAKE,awake);
         i.putExtra(EXTRA_LEVEL,realtimeLevel);
