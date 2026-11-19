@@ -10,7 +10,6 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
-import android.speech.SpeechRecognizer;
 import android.view.WindowManager;
 import android.widget.Toast;
 
@@ -56,53 +55,18 @@ public final class MainActivity extends Activity implements RexView.Actions {
     @Override public void onStartVoice() {
         if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},MIC_REQUEST);
-        } else chooseSpeechEngine();
+        } else startVoice();
     }
     @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results) {
         super.onRequestPermissionsResult(request,permissions,results);
         if(request!=MIC_REQUEST) return;
-        if(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED) chooseSpeechEngine();
+        if(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED) startVoice();
         else view.setMessage("麦克风权限未授权，语音监听未启动");
-    }
-    private void chooseSpeechEngine() {
-        boolean local=Build.VERSION.SDK_INT>=31&&SpeechRecognizer.isOnDeviceRecognitionAvailable(this);
-        boolean system=SpeechRecognizer.isRecognitionAvailable(this);
-        if(!local&&!system) {
-            new AlertDialog.Builder(this).setTitle("未找到语音识别引擎")
-                .setMessage("此手机当前没有可用的 Android 语音识别服务，可能需要在系统设置中安装中文语音服务。")
-                .setPositiveButton("知道了",null).show();
-            view.setMessage("无法唤醒：没有安装语音引擎");
-            return;
-        }
-        if(local&&system) {
-            new AlertDialog.Builder(this).setTitle("选择 REx 识别引擎")
-                .setMessage("如果之前说 Rex 没反应，可以改用系统识别。系统语音服务可能联网；两个模式都只显示命令，不授权机器人运动。")
-                .setItems(new String[]{"本机离线识别（优先）","系统默认识别（可能联网）"},
-                    (dialog,which)->selectEngine(which==1)).show();
-        } else if(local) {
-            selectEngine(false);
-        } else {
-            new AlertDialog.Builder(this).setTitle("离线识别不可用")
-                .setMessage("可以尝试系统默认语音识别服务，但该服务可能将语音发给网络提供商。仅用于显示和界面切换。是否允许？")
-                .setNegativeButton("取消",null)
-                .setPositiveButton("允许系统识别",(dialog,which)->selectEngine(true))
-                .show();
-        }
-    }
-    private void selectEngine(boolean system) {
-        getSharedPreferences("rex_settings",MODE_PRIVATE).edit()
-            .putBoolean(VoiceService.PREF_ALLOW_SYSTEM,system)
-            .putBoolean(VoiceService.PREF_FORCE_SYSTEM,system)
-            .apply();
-        // A new engine choice must be used by a newly created VoiceService.
-        // If the service was already running, stop it first.
-        stopService(new Intent(this,VoiceService.class));
-        getWindow().getDecorView().postDelayed(this::startVoice,250);
     }
     private void startVoice() {
         try {
             startForegroundService(new Intent(this,VoiceService.class));
-            view.setMessage("已请求启动语音服务 · 看下方实时识别状态");
+            view.setMessage("REx 本地 Vosk 引擎启动中 · 首次需解压内置模型");
         } catch(Exception e) {
             view.setMessage("语音启动失败："+e.getClass().getSimpleName());
         }

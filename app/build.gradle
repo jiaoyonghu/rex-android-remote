@@ -7,11 +7,72 @@ android {
         applicationId 'com.rex.remote'
         minSdk 29
         targetSdk 36
-        versionCode 2
-        versionName '0.2.0-beta'
+        versionCode 3
+        versionName '0.3.0-offline'
+        ndk { abiFilters 'arm64-v8a' }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    // Bundles an offline ASR runtime into the APK; NO system SpeechRecognizer.
+    implementation 'com.alphacephei:vosk-android:0.3.75@aar'
+    implementation 'net.java.dev.jna:jna:5.18.1@aar'
+}
+
+// Model is bundled into the *built* APK, not downloaded by the phone.
+// GitHub Actions downloads the official Apache-2.0 model at build time.
+// The source ZIP intentionally omits this ~42MB binary.
+def modelDest = file('src/main/assets/vosk-model-small-cn-0.22.zip')
+tasks.register('prepareRexBundledModel') {
+    outputs.file(modelDest)
+    doLast {
+        if (modelDest.exists() && modelDest.length() > 20000000L) {
+            println "REx: bundled Chinese offline model present (${modelDest.length()} bytes)"
+            return
+        }
+        modelDest.parentFile.mkdirs()
+        def tmp = file(modelDest.absolutePath + '.part')
+        def url = new URL('https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip')
+        println 'REx: downloading official 42MB offline Chinese model for APK packaging...'
+        try {
+            def connection = url.openConnection()
+            connection.setConnectTimeout(30000)
+            connection.setReadTimeout(120000)
+            connection.getInputStream().withCloseable { ins ->
+                tmp.withOutputStream { out ->
+                    byte[] buf = new byte[32768]
+                    long total = 0
+                    int n
+                    while ((n = ins.read(buf)) != -1) {
+                        total += n
+                        if (total > 75000000L) throw new GradleException('model exceeded size limit')
+                        out.write(buf, 0, n)
+                    }
+                }
+            }
+            if (tmp.length() < 20000000L) throw new GradleException('incomplete model download')
+            java.util.zip.ZipFile check = new java.util.zip.ZipFile(tmp)
+            try {
+                if (check.getEntry('vosk-model-small-cn-0.22/am/final.mdl') == null ||
+                    check.getEntry('vosk-model-small-cn-0.22/conf/model.conf') == null)
+                    throw new GradleException('invalid Vosk model archive')
+            } finally { check.close() }
+            java.nio.file.Files.move(tmp.toPath(), modelDest.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            println 'REx: offline model bundled successfully'
+        } finally {
+            if (tmp.exists()) tmp.delete()
+        }
+    }
+}
+tasks.named('preBuild').configure { dependsOn tasks.named('prepareRexBundledModel') }
+// Asset merging MUST wait until the archive has actually been downloaded.
+tasks.configureEach {
+    if (name.startsWith('merge') && name.endsWith('Assets')) {
+        dependsOn tasks.named('prepareRexBundledModel')
     }
 }

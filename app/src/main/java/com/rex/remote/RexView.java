@@ -16,11 +16,11 @@ import java.util.ArrayList;
 import java.util.Random;
 
 /**
- * REx particle agent v0.2. No center core and no rings.
- * Idle: small/dense/static cloud at 70% active size.
- * Wake: red filament particles disperse with animated swirl; recognized speech
- * causes large wave deformation. Animated volume uses Android speech onset,
- * not ambient background microphone noise. Voice verification remains locked.
+ * REx v0.3 dual particle volumes: large filaments + small dense inner kernel.
+ * Neither is a geometric sphere/ring/disc; both have irregular radial surfaces.
+ * Sleep: both keep particle-relative positions rigid while globally rotating.
+ * Awake: independent particle motion and distinct core/outer trajectories.
+ * Voice energy affects deformation only after offline ASR sees speech hypotheses.
  */
 public final class RexView extends View {
     public interface Actions {
@@ -32,13 +32,16 @@ public final class RexView extends View {
     private final Actions actions;
     private final Paint paint=new Paint(Paint.ANTI_ALIAS_FLAG);
     private final ArrayList<Particle> swarm=new ArrayList<>();
+    private final ArrayList<Particle> coreSwarm=new ArrayList<>();
     private final ArrayList<TouchButton> controls=new ArrayList<>();
     private final float[] px=new float[1940];
     private final float[] py=new float[1940];
+    private final float[] corePx=new float[1248];
+    private final float[] corePy=new float[1248];
     private boolean manual;
-    private String message="v0.2 · 红外联调 · 机器人未确认";
+    private String message="v0.3 · 本地离线识别 · 红外仅联调";
     private String irStatus="正在检测 IR";
-    private String lastText="请点「开启监听」，再说 Rex";
+    private String lastText="点击开启本地离线监听，再说 Rex";
     private String voiceStatus="语音未启动";
     private String commandText="";
     private float voiceLevel;
@@ -87,6 +90,19 @@ public final class RexView extends View {
                 float phi=basePhi+(k-9.5f)*.028f+.09f*(float)Math.sin(k*.31f+bend);
                 phi=Math.max(.05f,Math.min((float)Math.PI-.05f,phi));
                 swarm.add(new Particle(r,theta,phi));
+            }
+        }
+        // Small inner field: many more tightly packed microfilaments, intentionally
+        // different spatial distribution and spin axis than the outer field.
+        for (int g=0; g<78; g++) {
+            float baseTheta=(float)(2*Math.PI*r.nextDouble());
+            float basePhi=(float)Math.acos(2*r.nextDouble()-1);
+            float bend=r.nextFloat()*6.28f;
+            for (int k=0; k<16; k++) {
+                float theta=baseTheta+(k-7.5f)*.084f+.13f*(float)Math.sin(k*.62f+bend);
+                float phi=basePhi+(k-7.5f)*.035f+.11f*(float)Math.sin(k*.43f+bend);
+                phi=Math.max(.04f,Math.min((float)Math.PI-.04f,phi));
+                coreSwarm.add(new Particle(r,theta,phi));
             }
         }
         add(121,165,239,225,"↑ 前进","0.6 m/s",RexCommand.FORWARD);
@@ -162,68 +178,105 @@ public final class RexView extends View {
         text(c,shortText(message,44),26,734,10,0xFFF0C5CB,false);
         text(c,"IR 单向传输 · 语音动作未授权 · 状态不代表机器人确认",26,752,8,0xFF9D7581,false);
     }
-    private void filaments(Canvas c,float seconds){
-        long now=SystemClock.elapsedRealtime();
-        float target=now<wakeUntilMs?1f:0f;
-        activeBlend+=(target-activeBlend)*.078f;
-        if(Math.abs(activeBlend-target)<.001f)activeBlend=target;
-        float energy=Math.min(1f,voiceLevel);
-        // Exactly 70% when asleep; ACTIVE expands to 100%.
-        float radius=122f*(.7f+.3f*activeBlend);
-        float cx=180f,cy=367f;
-        float movement=activeBlend;
-        // Diffuse red atmosphere WITHOUT a separate white core.
-        paint.setShader(new RadialGradient(cx,cy,159f,0x383C1321,0x00100C12,Shader.TileMode.CLAMP));
-        c.drawCircle(cx,cy,159f,paint);paint.setShader(null);
-        float time=seconds*.67f;
-        float t = time*movement;
-        float waveTime = seconds*9f;
+    /** Each volume is an irregular particle mesh; no primitive sphere or orbit rings. */
+    private void renderVolume(Canvas c,float seconds,boolean inner,float cx,float cy,
+                              float radius,float active,float energy){
+        ArrayList<Particle> particles=inner?coreSwarm:swarm;
+        float[] xs=inner?corePx:px;
+        float[] ys=inner?corePy:py;
+        int perStrand=inner?16:20;
+        // Always rotate as a whole in idle. Relative particle positions DO NOT change
+        // with time until active grows. The inner volume spins about its own
+        // tilted axes at a different speed and direction.
+        float spin=seconds*(inner?-.29f:.19f);
+        float waveClock=seconds*(inner?11.4f:8.5f);
         int i=0;
-        for(Particle a:swarm){
-            float theta=a.theta+t*(.16f+.03f*(float)Math.sin(a.twist));
+        for(Particle a:particles){
+            float theta=a.theta+spin;
             float phi=a.phi;
+            // Movement between particles only during wake; core has a distinct
+            // deformation field (not copied from the shell trajectories).
+            if(active>.001f){
+                theta+=active*(inner?.19f:.11f)*(float)Math.sin(
+                    seconds*(inner?2.9f:1.7f)+a.phase*2.1f+a.phi*8f);
+                phi+=active*(inner?.12f:.055f)*(float)Math.cos(
+                    seconds*(inner?3.1f:2.0f)+a.twist+a.theta*7f);
+            }
             float sx=(float)(Math.sin(phi)*Math.cos(theta));
             float sy=(float)Math.cos(phi);
             float sz=(float)(Math.sin(phi)*Math.sin(theta));
-            float ripple=(float)Math.sin(phi*9f+theta*5f+a.twist*2f+t*2.7f);
-            float coil=(float)Math.sin(theta*7f+phi*12f+a.phase);
-            float distortion=1f + .11f*ripple*movement + .075f*coil;
-            // Large local deformation ONLY while the recognition engine reports speech.
-            float voiceWave = energy*movement*(.20f+.26f*(float)Math.sin(waveTime+a.phase+phi*12f))
-                    *(float)Math.sin(theta*3f+waveTime*.41f);
-            float r=radius*a.spread*(distortion+voiceWave);
-            float depth=1f/(1.23f-.25f*sz);
-            float xx=cx+sx*r*depth + movement*energy*10f*(float)Math.sin(phi*8f+waveTime);
-            float yy=cy+sy*r*depth*.92f + movement*energy*12f*(float)Math.cos(theta*6f+waveTime);
-            px[i]=xx;py[i]=yy;
-            float a1=Math.max(0f,Math.min(1f, (sz+1f)/2f));
-            int alpha=(int)((38+140*a1)*a.brightness*(.76f+.24f*activeBlend));
-            solid(Color.argb(alpha,235,56+(int)(50*a1),93+(int)(41*a1)));
-            c.drawCircle(xx,yy,a.thickness*(.8f+.35f*a1),paint);
-            // Micro-fibers create a dense, tangled visual instead of sparse glowing dots.
-            if(i>0 && i%20!=0) {
-                float dx=xx-px[i-1],dy=yy-py[i-1];
-                if(dx*dx+dy*dy<2400f)
-                    line(c,px[i-1],py[i-1],xx,yy,
-                        Color.argb((int)(alpha*.38f),255,77,116),.43f);
+            // Static non-spherical bulges: visible even in idle, rotate rigidly.
+            float lobes=(float)Math.sin(a.theta*(inner?8f:5f)+a.phi*4f+a.twist);
+            float ridges=(float)Math.cos(a.phi*(inner?11f:7f)+a.phase);
+            float outline=1f + (inner?.14f:.11f)*lobes + (inner?.09f:.055f)*ridges;
+            float living=active*(inner?.18f:.12f)*(float)Math.sin(
+                seconds*(inner?4.1f:2.2f)+a.twist*2f+phi*9f);
+            float speechWave=energy*active*(inner?.36f:.42f)*
+                (float)Math.sin(waveClock+phi*(inner?15f:10f)+a.phase*2.3f);
+            float rr=radius*a.spread*(outline+living+speechWave);
+            // 2.5D projection without a rendered circular core.
+            float depth=1f/(1.18f-.20f*sz);
+            float xx=cx+sx*rr*depth;
+            float yy=cy+sy*rr*depth*(inner?.98f:.93f);
+            if(inner){ // independent drift in a different plane
+                xx+=active*energy*5f*(float)Math.sin(waveClock*.7f+phi*3f);
+                yy+=active*energy*4f*(float)Math.cos(waveClock*.9f+theta*4f);
+            } else {
+                xx+=active*energy*8f*(float)Math.cos(waveClock*.4f+phi*4f);
+                yy+=active*energy*10f*(float)Math.sin(waveClock*.5f+theta*3f);
             }
-            // Additional adjacent fibers (never circular HUD geometry).
-            if(i>3 && i%20>3 && i%5==0) {
+            xs[i]=xx;ys[i]=yy;
+            float near=Math.max(0f,Math.min(1f,(sz+1f)*.5f));
+            float brightness=inner?1.27f:1.15f;
+            int alpha=Math.max(0,Math.min(235,(int)((inner?66:48)
+                + (inner?158:146)*near)*a.brightness*brightness));
+            int red=255;
+            int green=inner?(100+(int)(76*near)):(70+(int)(67*near));
+            int blue=inner?(130+(int)(72*near)):(100+(int)(51*near));
+            solid(Color.argb(alpha,red,green,blue));
+            c.drawCircle(xx,yy,a.thickness*(inner?.72f:1.03f),paint);
+            if(i%perStrand!=0){
+                float dx=xx-xs[i-1],dy=yy-ys[i-1];
+                float maxDist=inner?270f:2400f;
+                if(dx*dx+dy*dy<maxDist)
+                    line(c,xs[i-1],ys[i-1],xx,yy,
+                        Color.argb((int)(alpha*(inner?.48f:.41f)),255,green,blue),
+                        inner?.32f:.45f);
+            }
+            if(i>3 && i%perStrand>3 && i%4==0){
                 int j=i-3;
-                float dx=px[i]-px[j], dy=py[i]-py[j];
-                if(dx*dx+dy*dy<640f) {
-                    line(c,px[j],py[j],xx,yy,Color.argb((int)(alpha*.27f),235,61,96),.40f);
-                }
+                float dx=xx-xs[j],dy=yy-ys[j];
+                if(dx*dx+dy*dy<(inner?100f:590f))
+                    line(c,xs[j],ys[j],xx,yy,
+                        Color.argb((int)(alpha*.28f),255,green,blue),
+                        inner?.24f:.32f);
             }
             i++;
         }
-        float s=activeBlend;
-        center(c,"R E X",cx,552,22,0xFFF4C6CF,true);
-        center(c,target>0.5f?"AWAKE  /  VOICE MONITOR":"DORMANT  /  AWAITING WAKE",cx,574,10,
-            target>0.5f?0xFFE88A9C:0xFF956875,false);
-        if(s>0.1f && energy>.06f) {
-            center(c,"SPEECH REACTIVITY  "+Math.round(energy*100)+"%",cx,590,8,0xFFFF8DAD,false);
-        }
+    }
+    private void filaments(Canvas c,float seconds){
+        long now=SystemClock.elapsedRealtime();
+        float target=now<wakeUntilMs?1f:0f;
+        activeBlend+=(target-activeBlend)*.08f;
+        if(Math.abs(activeBlend-target)<.001f)activeBlend=target;
+        float active=activeBlend;
+        float energy=Math.min(1f,voiceLevel);
+        float cx=180f,cy=367f;
+        float shellRadius=122f*(.70f+.30f*active);
+        float coreRadius=shellRadius*.25f;
+        // Subtle atmospheric scatter only; no bright sphere and no HUD circles.
+        paint.setShader(new RadialGradient(cx,cy,145f,
+            0x292E111C,0x00100C12,Shader.TileMode.CLAMP));
+        c.drawRect(32,202,328,525,paint);
+        paint.setShader(null);
+        renderVolume(c,seconds,false,cx,cy,shellRadius,active,energy);
+        renderVolume(c,seconds,true,cx,cy,coreRadius,active,energy);
+        center(c,"R E X",cx,552,22,0xFFFFD9E5,true);
+        center(c,target>.5f?"AWAKE / OFFLINE RECOGNITION":"DORMANT / ROTATING FIELDS",
+            cx,574,10,target>.5f?0xFFFF9DB4:0xFFAE7B87,false);
+        if(active>.1f && energy>.06f)
+            center(c,"VOICE FIELD  "+Math.round(energy*100)+"%",
+                cx,590,8,0xFFFF9EBE,false);
     }
     private void voicePanel(Canvas c){
         box(c,20,596,340,661,0xA3241825,11);
@@ -231,7 +284,7 @@ public final class RexView extends View {
         text(c,shortText(lastText,40),28,636,10,0xFFCFA1B2,false);
         text(c,shortText(commandText,39),28,653,9,0xFFFF8FA7,false);
         box(c,20,668,340,699,0xA74B1F30,11);
-        center(c,voiceStarted?"点击重新检测 / 长按关闭监听":"点击开启语音监听",180,688,12,0xFFF8D4DF,true);
+        center(c,voiceStarted?"本地语音运行中 / 长按关闭":"点击启动 APK 内置离线识别",180,688,12,0xFFF8D4DF,true);
         center(c,"左下空白处三击 → 按键模式",180,697,7,0xFF8F6D7B,false);
     }
     private void drawControls(Canvas c){
@@ -246,7 +299,7 @@ public final class RexView extends View {
             center(c,b.sub,b.r.centerX(),b.r.top+43,9,0xFFB693A1,false);
         }
         box(c,20,652,340,697,0x96382537,11);
-        center(c,"语音监听 · "+(voiceStarted?"已请求启动":"未启动"),180,671,11,0xFFF2C0CD,true);
+        center(c,"本地语音 · "+(voiceStarted?"已启动":"未启动"),180,671,11,0xFFF2C0CD,true);
         center(c,"点击开启 / 长按关闭 / 说 Rex 返回粒子界面",180,687,9,0xFFC593A4,false);
     }
     @Override protected void onDraw(Canvas raw){
