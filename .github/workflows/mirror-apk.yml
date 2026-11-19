@@ -1,0 +1,174 @@
+name: REx - Mirror existing APK to Gitee (no rebuild)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Optional: existing GitHub Actions build run ID; blank = newest available REx APK artifact'
+        required: false
+        type: string
+
+jobs:
+  mirror_only:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Download already-built APK from private GitHub artifact
+        id: fetch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED_RUN_ID" ]; then
+            [[ "$REQUESTED_RUN_ID" =~ ^[0-9]+$ ]] || { echo 'Run ID must be numeric'; exit 1; }
+            RUN_ID="$REQUESTED_RUN_ID"
+          else
+            RUN_ID="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.name == "REX-v0.3-offline-debug-APK" and .expired == false)] | first | .workflow_run.id // empty')"
+          fi
+          test -n "$RUN_ID" || { echo 'No matching unexpired GitHub APK artifact found'; exit 1; }
+          echo "Found build run: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          mkdir -p dist
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name REX-v0.3-offline-debug-APK \
+            --dir dist
+          test -s dist/app-debug.apk
+          ls -lh dist/app-debug.apk
+          sha256sum dist/app-debug.apk
+
+      - name: Upload APK to existing private Gitee mirror (streaming with retries)
+        shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPOSITORY: ${{ secrets.GITEE_REPOSITORY }}
+          SOURCE_RUN_ID: ${{ steps.fetch.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import time
+          import requests
+
+          token = os.getenv('GITEE_TOKEN', '').strip()
+          repo = os.getenv('GITEE_REPOSITORY', '').strip().strip('/')
+          run_id = os.getenv('SOURCE_RUN_ID', '').strip()
+          if not token or len(repo.split('/')) != 2:
+              raise SystemExit('Please set GITEE_TOKEN and GITEE_REPOSITORY repository secrets')
+          if not run_id.isdigit():
+              raise SystemExit('Invalid source GitHub Actions run ID')
+          apk = Path('dist/app-debug.apk')
+          if not apk.is_file() or not apk.stat().st_size:
+              raise SystemExit('Existing APK artifact is missing or empty')
+          if apk.stat().st_size > 95 * 1024 * 1024:
+              raise SystemExit('APK larger than safe Gitee release attachment size')
+
+          session = requests.Session()
+          session.headers.update({'Authorization': 'Bearer ' + token, 'Accept': 'application/json'})
+          base = 'https://gitee.com/api/v5/repos/' + repo
+          release_page = f'https://gitee.com/{repo}/releases'
+          tag = 'rex-apk-gh-' + run_id
+          filename = 'REX-' + tag + '.apk'
+
+          info = session.get(base, timeout=(20, 50))
+          info.raise_for_status()
+          branch = info.json().get('default_branch')
+          if not branch:
+              raise SystemExit('Gitee mirror repo has no default branch, initialize a README first')
+
+          existing = session.get(base + '/releases/tags/' + tag, timeout=(20, 50))
+          if existing.status_code == 404:
+              created = session.post(base + '/releases', data={
+                  'tag_name': tag,
+                  'target_commitish': branch,
+                  'name': 'REx Android APK ' + tag,
+                  'body': 'Only built APK mirrored; original GitHub source stays private.',
+                  'prerelease': 'true',
+              }, timeout=(20, 50))
+              created.raise_for_status()
+              release = created.json()
+              print('Created new Gitee release:', tag, flush=True)
+          else:
+              existing.raise_for_status()
+              release = existing.json()
+              print('Reusing existing Gitee release:', tag, flush=True)
+          release_id = release['id']
+          attach_url = f'{base}/releases/{release_id}/attach_files'
+
+          def uploaded():
+              try:
+                  response = session.get(attach_url, timeout=(20, 50))
+                  if not response.ok:
+                      print('Gitee attachment list HTTP:', response.status_code, flush=True)
+                      return None
+                  listing = response.json()
+                  if isinstance(listing, dict):
+                      listing = listing.get('data', listing.get('attach_files', []))
+                  for item in listing:
+                      if isinstance(item, dict) and item.get('name') == filename:
+                          size = item.get('size')
+                          if size is not None and int(size) != apk.stat().st_size:
+                              raise SystemExit('Gitee has same-name attachment with different size. Inspect release manually.')
+                          return item
+              except requests.RequestException as exc:
+                  print('Could not verify Gitee attachments:', type(exc).__name__, flush=True)
+              return None
+
+          result = uploaded()
+          for attempt in range(1, 4):
+              if result:
+                  break
+              print(f'Uploading existing APK: attempt {attempt}/3; size {apk.stat().st_size:,} bytes', flush=True)
+              # curl streams directly from file, avoiding requests multipart whole-file buffering.
+              # Do NOT print the command because the Authorization header contains a token.
+              response_file = Path('gitee_upload_result.json')
+              with response_file.open('wb') as output:
+                  proc = subprocess.run([
+                      'curl', '--http1.1', '--silent', '--show-error', '--fail-with-body',
+                      '--connect-timeout', '45', '--max-time', '900',
+                      '-H', 'Authorization: Bearer ' + token,
+                      '-H', 'Accept: application/json',
+                      '-F', 'file=@' + str(apk) + ';filename=' + filename + ';type=application/vnd.android.package-archive',
+                      attach_url,
+                  ], stdout=output, check=False)
+              if proc.returncode == 0:
+                  try:
+                      result = json.loads(response_file.read_text(encoding='utf-8'))
+                  except (ValueError, UnicodeDecodeError):
+                      result = uploaded()
+                  if result:
+                      break
+              print(f'Attempt {attempt} did not confirm upload (curl exit {proc.returncode})', flush=True)
+              # The server might have stored the file even if the connection broke before response.
+              result = uploaded()
+              if result:
+                  break
+              if attempt < 3:
+                  time.sleep(25)
+
+          if not result:
+              raise SystemExit('Gitee mirror upload failed after 3 attempts. APK remains available in GitHub Actions artifact; no recompilation needed.')
+
+          url = result.get('browser_download_url') or result.get('download_url')
+          sha = hashlib.sha256(apk.read_bytes()).hexdigest()
+          print('Gitee release page:', release_page)
+          if url:
+              print('Gitee APK download URL:', url)
+          print('APK SHA256:', sha)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('## REx 国内镜像：仅上传现有 APK（不编译）\n\n')
+              summary.write(f'- 来源 GitHub Actions run：`{run_id}`\n')
+              summary.write(f'- [Gitee 发行版页面]({release_page})\n')
+              if url:
+                  summary.write(f'- [下载 APK]({url})\n')
+              summary.write(f'- SHA256：`{sha}`\n')
+          PY
