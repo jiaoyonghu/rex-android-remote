@@ -87,6 +87,20 @@ jobs:
 
           existing = session.get(base + '/releases/tags/' + tag, timeout=(20, 50))
           if existing.status_code == 404:
+              release = None
+          else:
+              existing.raise_for_status()
+              try:
+                  release = existing.json()
+              except ValueError:
+                  raise SystemExit('Gitee release lookup returned invalid JSON; cannot safely continue')
+              # Gitee can return HTTP 200 with JSON null when this tag has no release.
+              # Do not mistake that response for an existing release.
+              if release is not None and (not isinstance(release, dict) or not release.get('id')):
+                  raise SystemExit('Gitee release lookup returned unexpected data (no release id); check Gitee API response')
+
+          if release is None:
+              print('Gitee release not found (including HTTP 200 + null). Creating:', tag, flush=True)
               created = session.post(base + '/releases', data={
                   'tag_name': tag,
                   'target_commitish': branch,
@@ -94,13 +108,18 @@ jobs:
                   'body': 'Only built APK mirrored; original GitHub source stays private.',
                   'prerelease': 'true',
               }, timeout=(20, 50))
-              created.raise_for_status()
-              release = created.json()
+              if not created.ok:
+                  print('Gitee release creation HTTP:', created.status_code, flush=True)
+                  created.raise_for_status()
+              try:
+                  release = created.json()
+              except ValueError:
+                  raise SystemExit('Gitee release creation returned invalid JSON')
               print('Created new Gitee release:', tag, flush=True)
           else:
-              existing.raise_for_status()
-              release = existing.json()
               print('Reusing existing Gitee release:', tag, flush=True)
+          if not isinstance(release, dict) or not release.get('id'):
+              raise SystemExit('Gitee release creation/query did not provide a release ID; upload has not started')
           release_id = release['id']
           attach_url = f'{base}/releases/{release_id}/attach_files'
 
@@ -142,8 +161,12 @@ jobs:
                   ], stdout=output, check=False)
               if proc.returncode == 0:
                   try:
-                      result = json.loads(response_file.read_text(encoding='utf-8'))
+                      payload = json.loads(response_file.read_text(encoding='utf-8'))
                   except (ValueError, UnicodeDecodeError):
+                      payload = None
+                  if isinstance(payload, dict) and payload.get('name') == filename and payload.get('id'):
+                      result = payload
+                  else:
                       result = uploaded()
                   if result:
                       break
