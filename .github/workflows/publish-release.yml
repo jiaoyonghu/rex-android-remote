@@ -1,0 +1,89 @@
+name: REx - Publish existing APK to GitHub Release (no rebuild)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Optional: GitHub Actions run ID containing the APK; blank = latest available v0.3 APK'
+        required: false
+        type: string
+
+jobs:
+  release_apk:
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download existing APK (no rebuild)
+        id: apk
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_RUN_ID" ]]; then
+            [[ "$REQUESTED_RUN_ID" =~ ^[0-9]+$ ]] || { echo 'ERROR: build_run_id must contain digits only'; exit 1; }
+            RUN_ID="$REQUESTED_RUN_ID"
+          else
+            RUN_ID="$(gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.name == "REX-v0.3-offline-debug-APK" and .expired == false)] | sort_by(.created_at) | reverse | .[0].workflow_run.id // empty')"
+          fi
+          test -n "$RUN_ID" || { echo 'ERROR: APK artifact not found or expired; provide a build run ID or build again'; exit 1; }
+          echo "Using existing build run: $RUN_ID"
+          mkdir -p dist
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name REX-v0.3-offline-debug-APK \
+            --dir dist
+          test -s dist/app-debug.apk || { echo 'ERROR: expected dist/app-debug.apk not found'; exit 1; }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum dist/app-debug.apk | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          ls -lh dist/app-debug.apk
+
+      - name: Publish public GitHub Release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.apk.outputs.run_id }}
+          SHA256: ${{ steps.apk.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          # A public repository is required for third-party proxies to fetch this link without credentials.
+          VISIBILITY="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.visibility')"
+          if [[ "$VISIBILITY" != 'public' ]]; then
+            echo 'ERROR: Repository is not public. GitHub Release will not be anonymously downloadable.'
+            exit 1
+          fi
+
+          TAG="rex-v0.3-build-${RUN_ID}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; checking for existing APK"
+            ASSET_COUNT="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '[.assets[] | select(.name == "app-debug.apk")] | length')"
+            if [[ "$ASSET_COUNT" == '0' ]]; then
+              gh release upload "$TAG" dist/app-debug.apk --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$TAG" dist/app-debug.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "REx Android v0.3 (build $RUN_ID)" \
+              --notes "Offline Vosk preview APK. Speech does not authorize robot motion. Source Actions run: $RUN_ID. SHA256: $SHA256" \
+              --prerelease
+          fi
+
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/app-debug.apk"
+          echo "Official APK: $URL"
+          echo "Accelerated mirror A: https://ghproxy.net/$URL"
+          echo "Accelerated mirror B: https://ghfast.top/$URL"
+          echo "SHA256: $SHA256"
+          {
+            echo '## REx APK release (no rebuild)'
+            echo
+            echo "- [Official APK]($URL)"
+            echo "- [Mirror 1 - ghproxy.net](https://ghproxy.net/$URL)"
+            echo "- [Mirror 2 - ghfast.top](https://ghfast.top/$URL)"
+            echo "- SHA256: \`$SHA256\`"
+            echo '- Third-party mirrors are independent services. Verify the APK hash before installing.'
+          } >> "$GITHUB_STEP_SUMMARY"
