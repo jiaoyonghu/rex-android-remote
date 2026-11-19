@@ -7,8 +7,8 @@ android {
         applicationId 'com.rex.remote'
         minSdk 29
         targetSdk 36
-        versionCode 3
-        versionName '0.3.0-offline'
+        versionCode 4
+        versionName '0.4.0-bilingual'
         ndk { abiFilters 'arm64-v8a' }
     }
     compileOptions {
@@ -23,56 +23,71 @@ dependencies {
     implementation 'net.java.dev.jna:jna:5.18.1@aar'
 }
 
-// Model is bundled into the *built* APK, not downloaded by the phone.
-// GitHub Actions downloads the official Apache-2.0 model at build time.
-// The source ZIP intentionally omits this ~42MB binary.
-def modelDest = file('src/main/assets/vosk-model-small-cn-0.22.zip')
-tasks.register('prepareRexBundledModel') {
-    outputs.file(modelDest)
+// Both official, permissively licensed Vosk small models are embedded in the
+// built APK. Neither model is fetched by the phone. Keep APK artifacts private
+// if you do not want the binary redistributed.
+def modelSpecs = [
+    [name: 'vosk-model-small-cn-0.22', label: 'Mandarin'],
+    [name: 'vosk-model-small-en-us-0.15', label: 'English']
+]
+def modelAssets = modelSpecs.collect { spec ->
+    file("src/main/assets/${spec.name}.zip")
+}
+tasks.register('prepareRexBundledModels') {
+    outputs.files(modelAssets)
     doLast {
-        if (modelDest.exists() && modelDest.length() > 20000000L) {
-            println "REx: bundled Chinese offline model present (${modelDest.length()} bytes)"
-            return
-        }
-        modelDest.parentFile.mkdirs()
-        def tmp = file(modelDest.absolutePath + '.part')
-        def url = new URL('https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip')
-        println 'REx: downloading official 42MB offline Chinese model for APK packaging...'
-        try {
-            def connection = url.openConnection()
-            connection.setConnectTimeout(30000)
-            connection.setReadTimeout(120000)
-            connection.getInputStream().withCloseable { ins ->
-                tmp.withOutputStream { out ->
-                    byte[] buf = new byte[32768]
-                    long total = 0
-                    int n
-                    while ((n = ins.read(buf)) != -1) {
-                        total += n
-                        if (total > 75000000L) throw new GradleException('model exceeded size limit')
-                        out.write(buf, 0, n)
+        modelSpecs.each { spec ->
+            def zipDest = file("src/main/assets/${spec.name}.zip")
+            def expectedModel = "${spec.name}/am/final.mdl"
+            def expectedConf = "${spec.name}/conf/model.conf"
+            def archiveValid = { f ->
+                if (!f.exists() || f.length() < 20000000L) return false
+                try {
+                    def z = new java.util.zip.ZipFile(f)
+                    try {
+                        return z.getEntry(expectedModel) != null &&
+                            z.getEntry(expectedConf) != null
+                    } finally { z.close() }
+                } catch (Exception ignored) { return false }
+            }
+            if (archiveValid(zipDest)) {
+                println "REx: bundled ${spec.label} model present (${zipDest.length()} bytes)"
+                return
+            }
+            zipDest.parentFile.mkdirs()
+            def temp = file(zipDest.absolutePath + '.part')
+            def url = new URL("https://alphacephei.com/vosk/models/${spec.name}.zip")
+            println "REx: downloading official ${spec.label} model for APK bundling..."
+            try {
+                def conn = url.openConnection()
+                conn.setConnectTimeout(30000)
+                conn.setReadTimeout(180000)
+                conn.getInputStream().withCloseable { ins ->
+                    temp.withOutputStream { out ->
+                        byte[] buf = new byte[32768]
+                        long total = 0
+                        int n
+                        while ((n = ins.read(buf)) != -1) {
+                            total += n
+                            if (total > 75000000L)
+                                throw new GradleException('Vosk model exceeded compressed size limit')
+                            out.write(buf, 0, n)
+                        }
                     }
                 }
+                if (!archiveValid(temp))
+                    throw new GradleException("Invalid or incomplete ${spec.label} Vosk model")
+                java.nio.file.Files.move(temp.toPath(), zipDest.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                println "REx: ${spec.label} offline model bundled successfully"
+            } finally {
+                if (temp.exists()) temp.delete()
             }
-            if (tmp.length() < 20000000L) throw new GradleException('incomplete model download')
-            java.util.zip.ZipFile check = new java.util.zip.ZipFile(tmp)
-            try {
-                if (check.getEntry('vosk-model-small-cn-0.22/am/final.mdl') == null ||
-                    check.getEntry('vosk-model-small-cn-0.22/conf/model.conf') == null)
-                    throw new GradleException('invalid Vosk model archive')
-            } finally { check.close() }
-            java.nio.file.Files.move(tmp.toPath(), modelDest.toPath(),
-                java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-            println 'REx: offline model bundled successfully'
-        } finally {
-            if (tmp.exists()) tmp.delete()
         }
     }
 }
-tasks.named('preBuild').configure { dependsOn tasks.named('prepareRexBundledModel') }
-// Asset merging MUST wait until the archive has actually been downloaded.
+tasks.named('preBuild').configure { dependsOn tasks.named('prepareRexBundledModels') }
 tasks.configureEach {
-    if (name.startsWith('merge') && name.endsWith('Assets')) {
-        dependsOn tasks.named('prepareRexBundledModel')
-    }
+    if (name.startsWith('merge') && name.endsWith('Assets'))
+        dependsOn tasks.named('prepareRexBundledModels')
 }

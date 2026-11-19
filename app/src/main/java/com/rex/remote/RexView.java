@@ -16,7 +16,7 @@ import java.util.ArrayList;
 import java.util.Random;
 
 /**
- * REx v0.3 dual particle volumes: large filaments + small dense inner kernel.
+ * REx v0.4 dual particle volumes: large filaments + small dense inner kernel.
  * Neither is a geometric sphere/ring/disc; both have irregular radial surfaces.
  * Sleep: both keep particle-relative positions rigid while globally rotating.
  * Awake: independent particle motion and distinct core/outer trajectories.
@@ -39,9 +39,9 @@ public final class RexView extends View {
     private final float[] corePx=new float[1248];
     private final float[] corePy=new float[1248];
     private boolean manual;
-    private String message="v0.3 · 本地离线识别 · 红外仅联调";
+    private String message="v0.4 · 中英双语离线监听 · 红外仅联调";
     private String irStatus="正在检测 IR";
-    private String lastText="点击开启本地离线监听，再说 Rex";
+    private String lastText="请说 Rex / 瑞克斯，再用中文或 English 发出命令";
     private String voiceStatus="语音未启动";
     private String commandText="";
     private float voiceLevel;
@@ -114,9 +114,10 @@ public final class RexView extends View {
         add(188,389,340,444,"右转圈 ↷","0.4 rad/s",RexCommand.TURN_RIGHT);
         add(20,455,172,508,"站立","STAND",RexCommand.STAND);
         add(188,455,340,508,"闪身步","左右随机 3 秒",RexCommand.DODGE);
-        add(20,520,172,573,"转个圈","随机方向",RexCommand.TURN_AROUND);
-        add(188,520,340,573,"激活","ACTIVE",RexCommand.ACTIVE);
-        add(20,585,340,639,"失能  ·  高风险","二次确认",RexCommand.DISABLE);
+        // Leave the REX-left lower blank region free in BOTH voice and button modes.
+        add(188,520,340,573,"转个圈","随机方向",RexCommand.TURN_AROUND);
+        add(20,585,172,639,"激活","ACTIVE",RexCommand.ACTIVE);
+        add(188,585,340,639,"失能 · 高风险","二次确认",RexCommand.DISABLE);
         setLayerType(View.LAYER_TYPE_HARDWARE,null);
     }
     private void add(float l,float t,float r,float b,String title,String sub,RexCommand cmd){
@@ -228,9 +229,9 @@ public final class RexView extends View {
             xs[i]=xx;ys[i]=yy;
             float near=Math.max(0f,Math.min(1f,(sz+1f)*.5f));
             float brightness=inner?1.27f:1.15f;
-            int alpha = Math.max(0, Math.min(235,
-                Math.round(((inner ? 66 : 48) + (inner ? 158 : 146) * near)
-                    * a.brightness * brightness)));
+            int alpha=Math.max(0,Math.min(235,
+                Math.round(((inner?66:48)+(inner?158:146)*near)
+                    *a.brightness*brightness)));
             int red=255;
             int green=inner?(100+(int)(76*near)):(70+(int)(67*near));
             int blue=inner?(130+(int)(72*near)):(100+(int)(51*near));
@@ -286,7 +287,7 @@ public final class RexView extends View {
         text(c,shortText(commandText,39),28,653,9,0xFFFF8FA7,false);
         box(c,20,668,340,699,0xA74B1F30,11);
         center(c,voiceStarted?"本地语音运行中 / 长按关闭":"点击启动 APK 内置离线识别",180,688,12,0xFFF8D4DF,true);
-        center(c,"左下空白处三击 → 按键模式",180,697,7,0xFF8F6D7B,false);
+        center(c,"REX 左侧空白处三击 → 按键模式",180,697,7,0xFF8F6D7B,false);
     }
     private void drawControls(Canvas c){
         for(TouchButton b:controls){
@@ -301,7 +302,7 @@ public final class RexView extends View {
         }
         box(c,20,652,340,697,0x96382537,11);
         center(c,"本地语音 · "+(voiceStarted?"已启动":"未启动"),180,671,11,0xFFF2C0CD,true);
-        center(c,"点击开启 / 长按关闭 / 说 Rex 返回粒子界面",180,687,9,0xFFC593A4,false);
+        center(c,"点击开启 / 长按关闭 / REX 左侧空白三击返回",180,687,9,0xFFC593A4,false);
     }
     @Override protected void onDraw(Canvas raw){
         super.onDraw(raw);
@@ -322,8 +323,9 @@ public final class RexView extends View {
         if(e.getAction()==MotionEvent.ACTION_DOWN){downMs=SystemClock.elapsedRealtime();return true;}
         if(e.getAction()==MotionEvent.ACTION_UP){
             long now=SystemClock.elapsedRealtime();
-            // Left-bottom region unoccupied by actionable controls in both modes.
-            if(x<90 && y>702 && y<712){
+            // Large, practical REX-left touch area ABOVE the transcript panel.
+            // Exactly the same vacant rectangle is reserved in manual mode.
+            if(x>=22 && x<=140 && y>=517 && y<=582){
                 taps=(now-lastTapMs<730)?taps+1:1;
                 lastTapMs=now;
                 if(taps>=3){manual=!manual;taps=0;invalidate();}

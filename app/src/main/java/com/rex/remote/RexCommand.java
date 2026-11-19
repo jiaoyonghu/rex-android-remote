@@ -2,7 +2,11 @@ package com.rex.remote;
 
 import java.util.Locale;
 
-/** Fixed robot vocabulary. Exact matching after punctuation normalization. */
+/**
+ * Deliberately SMALL bilingual vocabulary. A free-form transcript cannot trigger
+ * a robot command by substring matching. Voice results remain UI-only until a
+ * separate, tested owner-authentication + robot safety layer is implemented.
+ */
 public enum RexCommand {
     WAKE(0x10, "唤醒", ""),
     STAND(0x11, "站立", ""),
@@ -31,41 +35,46 @@ public enum RexCommand {
             .replaceAll("[\\s\\p{Punct}，。！？、：；“”‘’（）《》～…]", "");
     }
 
-    /** Recognizer may transcribe the spoken English wake word as Chinese. */
     public static boolean isWake(String text) {
-        String s = norm(text);
-        return s.equals("rex") || s.equals("rex醒了吗")
-            || s.equals("瑞克斯") || s.equals("瑞克斯醒了吗")
-            || s.equals("雷克斯") || s.equals("雷克斯醒了吗");
+        return stripWakePrefix(text) != null;
     }
 
-    /** Returns the trailing command only when the utterance starts with a wake word. */
+    /** Strict wake matching: e.g. "Rex 前进" works, "rexterity" does not. */
     public static String stripWakePrefix(String text) {
         String s = norm(text);
-        for (String prefix : new String[]{"rex醒了吗", "瑞克斯醒了吗", "雷克斯醒了吗",
-                "rex", "瑞克斯", "雷克斯"}) {
-            if (s.startsWith(prefix)) return s.substring(prefix.length());
+        for (String prefix : new String[]{"rexareyouawake", "rexareyouthere", "rexwakeup",
+                "rex醒了吗", "瑞克斯醒了吗", "雷克斯醒了吗", "rex", "瑞克斯", "雷克斯"}) {
+            if (s.startsWith(prefix)) {
+                String remainder = s.substring(prefix.length());
+                if (remainder.isEmpty() || parse(remainder) != null) return remainder;
+            }
         }
         return null;
     }
 
+    /** Whole utterance matching: English, Mandarin and selected established aliases. */
     public static RexCommand parse(String text) {
         String s = norm(text);
         switch (s) {
             case "rex": case "rex醒了吗": case "瑞克斯": case "瑞克斯醒了吗":
-            case "雷克斯": case "雷克斯醒了吗": return WAKE;
-            case "站立": case "立正": return STAND;
-            case "前进": case "疯狂水世界启动": return FORWARD;
-            case "左移": return LEFT;
-            case "右移": return RIGHT;
-            case "后退": case "退": return BACKWARD;
-            case "左转圈": return TURN_LEFT;
-            case "右转圈": return TURN_RIGHT;
-            case "好停": case "停": return STOP;
-            case "闪身步": return DODGE;
-            case "转个圈": case "turnaround": return TURN_AROUND;
+            case "雷克斯": case "雷克斯醒了吗": case "rexareyouawake":
+            case "rexareyouthere": case "rexwakeup": return WAKE;
+            case "站立": case "立正": case "stand": case "standup":
+            case "attention": return STAND;
+            case "前进": case "疯狂水世界启动": case "forward": case "goforward":
+            case "moveforward": case "crazywaterworldstart": return FORWARD;
+            case "左移": case "moveleft": case "stepleft": case "shiftleft": return LEFT;
+            case "右移": case "moveright": case "stepright": case "shiftright": return RIGHT;
+            case "后退": case "退": case "back": case "backward": case "goback":
+            case "movebackward": return BACKWARD;
+            case "左转圈": case "turnleft": case "rotateleft": case "spinleft": return TURN_LEFT;
+            case "右转圈": case "turnright": case "rotateright": case "spinright": return TURN_RIGHT;
+            case "好停": case "停": case "停止": case "stop": case "okaystop":
+            case "okstop": case "hold": return STOP;
+            case "闪身步": case "dodge": case "sidestep": return DODGE;
+            case "转个圈": case "turnaround": case "spinaround": return TURN_AROUND;
             case "挂机": case "挂壁": case "disable": return DISABLE;
-            case "激活": case "active": return ACTIVE;
+            case "激活": case "active": case "activate": return ACTIVE;
             default: return null;
         }
     }

@@ -27,7 +27,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 /**
- * REx v0.3: IN-APP OFFLINE Chinese ASR via bundled Vosk acoustic model.
+ * REx v0.4: IN-APP OFFLINE Mandarin + English ASR (two Vosk decoders).
  * Does NOT call Android SpeechRecognizer and requires NO network permission.
  * A microphone foreground service keeps sampling while allowed by Android 16.
  * Speaker verification and replay protection are NOT implemented, therefore
@@ -43,12 +43,14 @@ public final class VoiceService extends Service {
     public static final String EXTRA_LEVEL = "level";
     public static final String EXTRA_STATUS = "status";
     public static final String EXTRA_SPEAKING = "speaking";
-    private static final String CHANNEL = "rex_offline_voice_v3";
+    private static final String CHANNEL = "rex_offline_voice_v4";
     private static final String TAG = "RExOfflineVoice";
     private static final int SAMPLE_RATE = 16000;
     private static final long WAKE_WINDOW_MS = 15000L;
-    private static final String MODEL_ZIP = "vosk-model-small-cn-0.22.zip";
-    private static final String MODEL_FOLDER = "vosk-model-small-cn-0.22";
+    private static final String ZH_MODEL_ZIP = "vosk-model-small-cn-0.22.zip";
+    private static final String ZH_MODEL_FOLDER = "vosk-model-small-cn-0.22";
+    private static final String EN_MODEL_ZIP = "vosk-model-small-en-us-0.15.zip";
+    private static final String EN_MODEL_FOLDER = "vosk-model-small-en-us-0.15";
     private static final long MAX_EXPANDED_BYTES = 340L * 1024 * 1024;
 
     private volatile boolean running;
@@ -61,6 +63,8 @@ public final class VoiceService extends Service {
     private String lastPartial = "";
     private long speechSinceMs;
     private long lastPartialMs;
+    private String lastFinalSignature = "";
+    private long lastFinalMs;
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
@@ -75,13 +79,13 @@ public final class VoiceService extends Service {
             stopSelf(); return START_NOT_STICKY;
         }
         NotificationManager nm = getSystemService(NotificationManager.class);
-        nm.createNotificationChannel(new NotificationChannel(CHANNEL, "REx 本地离线监听", NotificationManager.IMPORTANCE_LOW));
+        nm.createNotificationChannel(new NotificationChannel(CHANNEL, "REx 中英双语离线监听", NotificationManager.IMPORTANCE_LOW));
         PendingIntent open = PendingIntent.getActivity(this, 0,
             new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification n = new Notification.Builder(this, CHANNEL)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("REx · 本地离线监听")
+            .setContentTitle("REx · 中英双语离线监听")
             .setContentText("正在等待 Rex 唤醒 · 语音不会控制电机")
             .setContentIntent(open).setOngoing(true).build();
         try {
@@ -105,38 +109,41 @@ public final class VoiceService extends Service {
         publish(null, false, null, 0f);
     }
 
-    /** Copies the model bundled INSIDE the APK to app-private storage on first start. */
-    private File unpackBundledModel() throws Exception {
+    /** Copies one prepackaged Vosk ZIP into app-private storage on first use. */
+    private File unpackBundledModel(String zipName, String folder, String language) throws Exception {
         File root = new File(getFilesDir(), "rex_offline_models");
-        File dest = new File(root, MODEL_FOLDER);
-        File ready = new File(dest, ".rex_model_ready_v3");
-        if (ready.isFile() && new File(dest, "am/final.mdl").isFile()
-                && new File(dest, "conf/model.conf").isFile()) return dest;
-        updateStatus("首次启动 · 解压 APK 内置中文模型（只需一次）");
+        File dest = new File(root, folder);
+        File ready = new File(dest, ".rex_model_ready_v4");
+        boolean valid = new File(dest, "am/final.mdl").isFile()
+            && new File(dest, "conf/model.conf").isFile();
+        if (valid && (ready.isFile() || new File(dest, ".rex_model_ready_v3").isFile())) {
+            if (!ready.isFile()) ready.createNewFile();
+            return dest;
+        }
+        updateStatus("首次运行 · 解压内置" + language + "语音模型");
         if (!root.exists() && !root.mkdirs()) throw new IllegalStateException("无法创建模型目录");
         long expanded = 0;
         int entries = 0;
-        try (InputStream source = getAssets().open(MODEL_ZIP);
+        try (InputStream source = getAssets().open(zipName);
              ZipInputStream zip = new ZipInputStream(new BufferedInputStream(source))) {
             ZipEntry entry;
             byte[] buf = new byte[32768];
+            String rootPath = root.getCanonicalPath() + File.separator;
             while ((entry = zip.getNextEntry()) != null) {
-                entries++;
-                if (entries > 8000) throw new IllegalStateException("模型条目超出限制");
+                if (++entries > 8000) throw new IllegalStateException("模型条目超出限制");
                 String name = entry.getName().replace('\\', '/');
-                if (!name.startsWith(MODEL_FOLDER + "/") || name.contains("../")
-                        || name.startsWith("/")) throw new IllegalStateException("异常模型路径：" + name);
+                if (!name.startsWith(folder + "/") || name.contains("../") || name.startsWith("/"))
+                    throw new IllegalStateException("异常模型路径：" + name);
                 File target = new File(root, name);
-                // Canonical containment prevents ZIP slip.
-                String rootPath = root.getCanonicalPath() + File.separator;
                 if (!target.getCanonicalPath().startsWith(rootPath))
                     throw new IllegalStateException("模型路径越界");
                 if (entry.isDirectory()) {
-                    if (!target.exists() && !target.mkdirs()) throw new IllegalStateException("无法创建目录");
+                    if (!target.exists() && !target.mkdirs())
+                        throw new IllegalStateException("模型目录创建失败");
                 } else {
                     File parent = target.getParentFile();
                     if (parent != null && !parent.exists() && !parent.mkdirs())
-                        throw new IllegalStateException("无法创建子目录");
+                        throw new IllegalStateException("模型子目录创建失败");
                     try (FileOutputStream out = new FileOutputStream(target)) {
                         int n;
                         while ((n = zip.read(buf)) != -1) {
@@ -152,18 +159,23 @@ public final class VoiceService extends Service {
         }
         if (!new File(dest, "am/final.mdl").isFile()
                 || !new File(dest, "conf/model.conf").isFile())
-            throw new IllegalStateException("内置模型不完整");
-        if (!ready.createNewFile() && !ready.exists()) throw new IllegalStateException("模型完成标记失败");
+            throw new IllegalStateException(language + "内置模型不完整");
+        if (!ready.createNewFile() && !ready.exists())
+            throw new IllegalStateException("模型完成标记失败");
         return dest;
     }
 
     private void recognitionLoop() {
         try {
-            File modelDir = unpackBundledModel();
+            File zhDir = unpackBundledModel(ZH_MODEL_ZIP, ZH_MODEL_FOLDER, "中文");
             if (!running) return;
-            updateStatus("离线中文模型加载中（不联网）…");
-            try (Model model = new Model(modelDir.getAbsolutePath());
-                 Recognizer recognizer = new Recognizer(model, SAMPLE_RATE)) {
+            File enDir = unpackBundledModel(EN_MODEL_ZIP, EN_MODEL_FOLDER, "英文");
+            if (!running) return;
+            updateStatus("正在加载中文 + English 双模型（全离线）…");
+            try (Model zhModel = new Model(zhDir.getAbsolutePath());
+                 Model enModel = new Model(enDir.getAbsolutePath());
+                 Recognizer zh = new Recognizer(zhModel, SAMPLE_RATE);
+                 Recognizer en = new Recognizer(enModel, SAMPLE_RATE)) {
                 int min = AudioRecord.getMinBufferSize(SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
                 if (min <= 0) throw new IllegalStateException("麦克风不支持 16kHz");
@@ -185,8 +197,11 @@ public final class VoiceService extends Service {
                         }
                     }
                     mic.startRecording();
-                    updateStatus("REx 本地离线监听中 · 请说 Rex / 瑞克斯");
-                    short[] buffer = new short[3200]; // 200ms PCM16, never uploads audio
+                    updateStatus("中英双语离线监听中 · Rex / 瑞克斯");
+                    short[] buffer = new short[3200]; // single PCM stream to BOTH recognizers
+                    String finalZh = "", finalEn = "";
+                    boolean endedZh = false, endedEn = false;
+                    long pendingSince = 0;
                     while (running) {
                         int count = mic.read(buffer, 0, buffer.length, AudioRecord.READ_BLOCKING);
                         if (!running) break;
@@ -195,38 +210,55 @@ public final class VoiceService extends Service {
                             continue;
                         }
                         float rms = rmsLevel(buffer, count);
-                        // A recognized speech partial is needed before UI voice reactivity.
-                        boolean endpoint = recognizer.acceptWaveForm(buffer, count);
-                        if (endpoint) {
-                            String finalText = getText(recognizer.getResult(), "text");
-                            speaking = false;
-                            lastPartial = "";
-                            speechSinceMs = 0;
-                            if (!finalText.isEmpty()) consume(finalText);
-                            else if (SystemClock.elapsedRealtime() > wakeUntilMs)
-                                updateStatus("正在等待 Rex 唤醒（本机离线）");
-                        } else {
-                            String part = getText(recognizer.getPartialResult(), "partial");
-                            long now = SystemClock.elapsedRealtime();
-                            // Noise alone (RMS without phonetic recognition) NEVER wakes UI.
-                            if (!part.isEmpty() && rms > .045f) {
-                                if (speechSinceMs == 0) speechSinceMs = now;
-                                if (now - speechSinceMs >= 200) {
-                                    speaking = true;
-                                    if (!part.equals(lastPartial)) {
-                                        lastPartial = part;
-                                        lastPartialMs = now;
-                                        status = "本机识别中：" + part;
-                                    }
-                                    if (now - lastLevelBroadcastMs >= 70) {
-                                        lastLevelBroadcastMs = now;
-                                        publish(null, false, null, Math.min(1f, rms * 4.2f));
-                                    }
+                        long now = SystemClock.elapsedRealtime();
+                        boolean zhEnd = zh.acceptWaveForm(buffer, count);
+                        boolean enEnd = en.acceptWaveForm(buffer, count);
+                        String zhPart = "", enPart = "";
+                        if (zhEnd) {
+                            finalZh = getText(zh.getResult(), "text");
+                            endedZh = true;
+                        } else if (!endedZh) {
+                            zhPart = getText(zh.getPartialResult(), "partial");
+                        }
+                        if (enEnd) {
+                            finalEn = getText(en.getResult(), "text");
+                            endedEn = true;
+                        } else if (!endedEn) {
+                            enPart = getText(en.getPartialResult(), "partial");
+                        }
+                        // One ASR endpoint often arrives before the other. Allow the
+                        // second model 800 ms to finish; retain its latest partial.
+                        if ((zhEnd || enEnd) && pendingSince == 0) pendingSince = now;
+                        if (pendingSince > 0 && ((endedZh && endedEn)
+                                || now - pendingSince >= 800)) {
+                            String z = endedZh ? finalZh : zhPart;
+                            String e = endedEn ? finalEn : enPart;
+                            if (!z.isEmpty() || !e.isEmpty()) consumePair(z, e);
+                            endedZh = false; endedEn = false;
+                            finalZh = ""; finalEn = ""; pendingSince = 0;
+                            speaking = false; lastPartial = ""; speechSinceMs = 0;
+                            if (z.isEmpty() && e.isEmpty() && now > wakeUntilMs)
+                                updateStatus("正在等待 Rex / 瑞克斯（中英双语离线）");
+                        }
+                        String part = !zhPart.isEmpty() ? zhPart : enPart;
+                        // Ambient volume alone cannot make the UI recognize a wake word.
+                        if (!part.isEmpty() && rms > .045f) {
+                            if (speechSinceMs == 0) speechSinceMs = now;
+                            if (now - speechSinceMs >= 200) {
+                                speaking = true;
+                                if (!part.equals(lastPartial)) {
+                                    lastPartial = part;
+                                    lastPartialMs = now;
+                                    status = "中英双语识别中：" + part;
                                 }
-                            } else if (now - lastPartialMs > 1000) {
-                                speaking = false;
-                                speechSinceMs = 0;
+                                if (now - lastLevelBroadcastMs >= 70) {
+                                    lastLevelBroadcastMs = now;
+                                    publish(null, false, null, Math.min(1f, rms * 4.2f));
+                                }
                             }
+                        } else if (now - lastPartialMs > 1000) {
+                            speaking = false;
+                            speechSinceMs = 0;
                         }
                     }
                 } finally {
@@ -237,8 +269,8 @@ public final class VoiceService extends Service {
                 }
             }
         } catch (Exception e) {
-            Log.e(TAG, "Offline recognition failed", e);
-            status = "本地识别错误：" + e.getClass().getSimpleName()
+            Log.e(TAG, "Bilingual offline recognition failed", e);
+            status = "中英离线识别错误：" + e.getClass().getSimpleName()
                 + " " + String.valueOf(e.getMessage());
             publish(null, false, null, 0f);
             running = false;
@@ -261,20 +293,20 @@ public final class VoiceService extends Service {
         return (float)Math.min(1.0, Math.sqrt(sum / count) * 8.0);
     }
 
-    private void consume(String heard) {
+    private void consumePair(String chinese, String english) {
         long now = SystemClock.elapsedRealtime();
-        String remainder = RexCommand.stripWakePrefix(heard);
-        boolean wake = remainder != null;
-        if (wake) wakeUntilMs = now + WAKE_WINDOW_MS;
-        RexCommand command = null;
-        if (wake) command = RexCommand.parse(remainder);
-        else if (now < wakeUntilMs) command = RexCommand.parse(heard);
-        if (command == RexCommand.WAKE) command = null;
-        status = wake ? "REx 已唤醒 · 本地语音监听"
-            : command != null ? "指令已识别 · 未通过本人声纹认证，未发射红外"
-            : "离线识别到文字 · 非唤醒/非白名单指令";
-        // Only wake/UI is affected. NO automatic infrared or ROS command.
-        publish(heard, wake, command, 0f);
+        String fingerprint = RexCommand.norm(chinese) + "|" + RexCommand.norm(english);
+        if (fingerprint.equals(lastFinalSignature) && now - lastFinalMs < 1800) return;
+        lastFinalSignature = fingerprint;
+        lastFinalMs = now;
+        BilingualCommandRouter.Match match = BilingualCommandRouter.resolve(
+            chinese, english, now < wakeUntilMs);
+        if (match.woke) wakeUntilMs = now + WAKE_WINDOW_MS;
+        status = match.woke ? "REx 已唤醒 · 中文 / English 均可"
+            : match.command != null ? "已识别指令 · 未通过本人声纹认证，不发射红外"
+            : "双语文字已识别 · 非唤醒/非白名单命令";
+        // Visualization + transcript only; no NecIr.send(), no ROS motor command.
+        publish(match.display(), match.woke, match.command, 0f);
     }
 
     private void publish(String text, boolean wake, RexCommand command, float level) {

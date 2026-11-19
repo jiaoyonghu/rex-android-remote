@@ -66,7 +66,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
     private void startVoice() {
         try {
             startForegroundService(new Intent(this,VoiceService.class));
-            view.setMessage("REx 本地 Vosk 引擎启动中 · 首次需解压内置模型");
+            view.setMessage("REx 中英双语 Vosk 启动中 · 首次解压两套内置模型");
         } catch(Exception e) {
             view.setMessage("语音启动失败："+e.getClass().getSimpleName());
         }
