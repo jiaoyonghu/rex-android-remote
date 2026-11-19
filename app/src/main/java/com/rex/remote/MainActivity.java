@@ -32,7 +32,25 @@ public final class MainActivity extends Activity implements RexView.Actions {
                 i.getStringExtra(VoiceService.EXTRA_STATUS),
                 i.getBooleanExtra(VoiceService.EXTRA_SPEAKING,false),
                 i.getStringExtra(VoiceService.EXTRA_OWNER),
-                i.getIntExtra(VoiceService.EXTRA_ENROLL_COUNT,0));
+                i.getIntExtra(VoiceService.EXTRA_ENROLL_COUNT,0),
+                i.getIntExtra(VoiceService.EXTRA_ENROLL_STEP,0),
+                i.getBooleanExtra(VoiceService.EXTRA_ENROLL_READY,false),
+                i.getBooleanExtra(VoiceService.EXTRA_ENROLL_CAPTURING,false));
+            String enrollmentEvent=i.getStringExtra(VoiceService.EXTRA_ENROLL_EVENT);
+            if("CAPTURE_FAIL".equals(enrollmentEvent)){
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("声纹采集失败")
+                    .setMessage(i.getStringExtra(VoiceService.EXTRA_STATUS)
+                        + "\n\n请点击『采集』重新朗读当前提示词。")
+                    .setPositiveButton("明白，重试",null).show();
+            }else if("ENROLL_DONE".equals(enrollmentEvent)){
+                new AlertDialog.Builder(MainActivity.this)
+                    .setTitle("声纹录入结束")
+                    .setMessage("所有 "+EnrollmentPrompts.count()
+                        +" 条提示词都已通过文本核对和声纹特征检查，已保存到本机。\n\n"
+                        +"这是实验性声纹匹配，尚不能防录音重放，也不会授权机器人运动。")
+                    .setPositiveButton("完成",null).show();
+            }
         }
     };
 
@@ -67,7 +85,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
         if(request!=MIC_REQUEST) return;
         if(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED){
             if(enrollmentAfterPermission) {
-                enrollmentAfterPermission=false;showEnrollmentMenu();
+                enrollmentAfterPermission=false;beginEnrollment();
             }else startVoice();
         }else{
             enrollmentAfterPermission=false;
@@ -92,36 +110,30 @@ public final class MainActivity extends Activity implements RexView.Actions {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},MIC_REQUEST);
             return;
         }
-        showEnrollmentMenu();
+        beginEnrollment();
     }
-    private void sendEnrollAction(String action){
+    private void beginEnrollment(){
+        // Persisted owner data remains intact until ALL prompted phrases pass.
+        sendEnrollAction(VoiceService.ACTION_ENROLL_BEGIN,0);
+    }
+    private void sendEnrollAction(String action,int step){
         try {
             Intent intent=new Intent(this,VoiceService.class).setAction(action);
+            intent.putExtra(VoiceService.EXTRA_ENROLL_STEP,step);
             if(VoiceService.ACTION_ENROLL_BEGIN.equals(action))startForegroundService(intent);
             else startService(intent);
-        }catch(Exception e){view.setMessage("声纹操作失败："+e.getClass().getSimpleName());}
+        }catch(Exception e){
+            view.setMessage("声纹操作失败："+e.getClass().getSimpleName());
+        }
     }
-    private void showEnrollmentMenu(){
-        new AlertDialog.Builder(this)
-            .setTitle("REx 本机声纹录入 · 实验版")
-            .setMessage("请在安静处依次说3～5段完整的话，每段尽量2～4秒，中间停顿，让REx分段采集。\n\n"
-                + "推荐：\n① Rex醒了吗，疯狂水世界启动\n② 灭建国，站立，左移，右移\n"
-                + "③ 转个圈，左转圈，右转圈\n④ 好，停，挂机，激活\n"
-                + "⑤ Rex，turn around，disable，active\n\n"
-                + "看到3段以上成功采集后，点『完成录入』。只保存特征，不保存音频；声纹不具备防录音重放能力。")
-            .setItems(new String[]{"开始录入（清空本次暂存）", "完成录入（至少3段）", "取消本次录入", "删除手机内已保存声纹"},
-                (dialog,which)->{
-                    switch(which){
-                        case 0: sendEnrollAction(VoiceService.ACTION_ENROLL_BEGIN);break;
-                        case 1: sendEnrollAction(VoiceService.ACTION_ENROLL_FINISH);break;
-                        case 2: sendEnrollAction(VoiceService.ACTION_ENROLL_CANCEL);break;
-                        case 3: new AlertDialog.Builder(this).setTitle("删除本机声纹？")
-                            .setMessage("仅删除REx App私有存储中的本人声纹特征。")
-                            .setNegativeButton("取消",null)
-                            .setPositiveButton("确认删除",(d,w)->sendEnrollAction(VoiceService.ACTION_ENROLL_CLEAR))
-                            .show();break;
-                    }
-                }).setNegativeButton("返回",null).show();
+    @Override public void onCaptureVoice(int step){
+        sendEnrollAction(VoiceService.ACTION_ENROLL_CAPTURE,step);
+    }
+    @Override public void onCompleteVoice(int step){
+        sendEnrollAction(VoiceService.ACTION_ENROLL_NEXT,step);
+    }
+    @Override public void onCancelVoiceEnrollment(){
+        sendEnrollAction(VoiceService.ACTION_ENROLL_CANCEL,0);
     }
     @Override public void onSend(RexCommand cmd) {
         if(cmd==RexCommand.SLEEP||cmd==RexCommand.WAKE)return;

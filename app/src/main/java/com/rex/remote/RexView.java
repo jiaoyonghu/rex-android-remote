@@ -28,6 +28,9 @@ public final class RexView extends View {
         void onStartVoice();
         void onStopVoice();
         void onEnrollVoice();
+        void onCaptureVoice(int step);
+        void onCompleteVoice(int step);
+        void onCancelVoiceEnrollment();
     }
     private static final int W=360,H=780;
     private final Actions actions;
@@ -39,8 +42,13 @@ public final class RexView extends View {
     private final float[] py=new float[1940];
     private final float[] corePx=new float[1248];
     private final float[] corePy=new float[1248];
-    private boolean manual;
-    private String message="v0.5 · 中英双语 + 声纹录入 · 语音红外未授权";
+    private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2;
+    private int page=PAGE_VOICE;
+    private int enrollStep;
+    private boolean enrollReady;
+    private boolean enrollmentDone;
+    private boolean enrollmentCapturing;
+    private String message="v0.6 · 实时人声门控 + 第三页声纹录入 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -52,9 +60,10 @@ public final class RexView extends View {
     private float activeBlend;
     private boolean speaking;
     private boolean voiceStarted;
-        private long lastTapMs;
+    private long lastLeftTapMs;
+    private long lastRightTapMs;
+    private int leftTaps,rightTaps;
     private long downMs;
-    private int taps;
     private final long startedAt=SystemClock.elapsedRealtime();
     private final Typeface regular=Typeface.create("sans-serif",Typeface.NORMAL);
     private final Typeface medium=Typeface.create("sans-serif-medium",Typeface.NORMAL);
@@ -117,8 +126,8 @@ public final class RexView extends View {
         add(188,389,340,444,"右转圈 ↷","0.4 rad/s",RexCommand.TURN_RIGHT);
         add(20,455,172,508,"站立","STAND",RexCommand.STAND);
         add(188,455,340,508,"闪身步","左右随机 3 秒",RexCommand.DODGE);
-        // Leave the REX-left lower blank region free in BOTH voice and button modes.
-        add(188,520,340,573,"转个圈","随机方向",RexCommand.TURN_AROUND);
+        // The left and right LOWER triple-tap spaces are free in BOTH modes.
+        add(143,520,217,578,"转个圈","随机",RexCommand.TURN_AROUND);
         add(20,585,172,639,"激活","ACTIVE",RexCommand.ACTIVE);
         add(188,585,340,639,"失能 · 高风险","二次确认",RexCommand.DISABLE);
         setLayerType(View.LAYER_TYPE_HARDWARE,null);
@@ -133,14 +142,19 @@ public final class RexView extends View {
     }
     public void onVoice(String text,String partial,String command,boolean wakeEvent,
                         boolean awakeNow,float level,String status,boolean speakingNow,
-                        String ownerNow,int voiceSamples){
+                        String ownerNow,int voiceSamples,int currentStep,boolean sampleReady,
+                        boolean captureActive){
         voiceStarted=true;
         if(status!=null)voiceStatus=status;
         if(ownerNow!=null)ownerStatus=ownerNow;
         enrollCount=voiceSamples;
+        enrollStep=currentStep;
+        enrollReady=sampleReady;
+        enrollmentCapturing=captureActive;
+        if(currentStep>=EnrollmentPrompts.count())enrollmentDone=true;
         awake=awakeNow;
         speaking=speakingNow;
-        if(wakeEvent) manual=false; // wake from manual mode always returns to REx
+        if(wakeEvent && page!=PAGE_OWNER) page=PAGE_VOICE; // never interrupt enrollment
         if(text!=null){
             lastText=text;
             if("SLEEP".equals(command))commandText="已听到『睡觉』 · 回待机";
@@ -184,7 +198,9 @@ public final class RexView extends View {
         line(c,18,108,342,108,0x55485A70,.7f);
         line(c,18,704,342,704,0x55485A70,.7f);
         text(c,"R E X",25,48,27,0xFFFFDCE0,true);
-        text(c,manual?"TACTICAL MANUAL":"VOICE REACTIVE / PARTICLE FIELD",25,68,10,0xFFC06A7B,false);
+        text(c,page==PAGE_MANUAL?"TACTICAL MANUAL":
+            (page==PAGE_OWNER?"VOICEPRINT / GUIDED ENROLLMENT":"VOICE REACTIVE / PARTICLE FIELD"),
+            25,68,10,0xFFC06A7B,false);
         text(c,"ONEPLUS ACE 3V  ·  ANDROID 16",25,87,9,0xFF8A6674,false);
         box(c,18,115,342,150,0x6C211B27,10);
         text(c,shortText(irStatus,39),27,137,10,0xFFD3ADB7,false);
@@ -293,10 +309,8 @@ public final class RexView extends View {
                 cx,590,8,0xFFFF9EBE,false);
     }
     private void voicePanel(Canvas c){
-        // Right of REX: voice-profile button. Left of REX stays free for triple tap.
-        box(c,246,526,336,578,0xB02C1A2C,9);
-        center(c,"声纹录入",291,548,12,0xFFFFC1D2,true);
-        center(c,"录入 / 完成",291,565,8,0xFFD59DAB,false);
+        // Both left and right of REX are reserved as triple-tap hot zones.
+        // No single-tap action is mapped here to avoid accidental entry.
         box(c,20,596,340,665,0xA3241825,11);
         text(c,shortText(voiceStatus,38),28,609,9,0xFFF1BAC8,false);
         text(c,shortText(lastText,39),28,625,9,0xFFFFC0CE,false);
@@ -304,7 +318,7 @@ public final class RexView extends View {
         text(c,shortText(commandText,39),28,657,8,0xFFFF8FA7,false);
         box(c,20,668,340,699,0xA74B1F30,11);
         center(c,voiceStarted?"离线语音运行中 / 长按关闭":"点击启动内置离线语音",180,687,12,0xFFF8D4DF,true);
-        center(c,"REX 左侧三击切换 / 右侧声纹录入",180,697,7,0xFF8F6D7B,false);
+        center(c,"REX 左侧三击按键 / 右侧三击声纹录入",180,697,7,0xFF8F6D7B,false);
     }
     private void drawControls(Canvas c){
         for(TouchButton b:controls){
@@ -319,15 +333,57 @@ public final class RexView extends View {
         }
         box(c,20,652,340,697,0x96382537,11);
         center(c,"本地语音 · "+(voiceStarted?"已启动":"未启动"),180,671,11,0xFFF2C0CD,true);
-        center(c,"点击开启 / 长按关闭 / REX 左侧空白三击返回",180,687,9,0xFFC593A4,false);
+        center(c,"左下三击切换 / 右下三击进入声纹录入",180,687,9,0xFFC593A4,false);
     }
+    private void drawEnrollment(Canvas c){
+        center(c,"主人声纹 / VOICEPRINT",180,191,18,0xFFFFCEDD,true);
+        if(enrollmentDone){
+            box(c,20,230,340,360,0xA32F1829,15);
+            center(c,"全部提示词采集完成",180,286,16,0xFFFFCDD9,true);
+            center(c,"声纹特征已保存在本机",180,319,11,0xFFCFA9B6,false);
+        }else{
+            box(c,20,225,340,349,0xAF231925,15);
+            text(c,"当前提示词 · "+(enrollStep+1)+" / "+EnrollmentPrompts.count(),34,248,12,0xFFC9A1B1,true);
+            center(c,EnrollmentPrompts.at(Math.max(0,Math.min(enrollStep,EnrollmentPrompts.count()-1))),
+                180,289,EnrollmentPrompts.at(Math.max(0,Math.min(enrollStep,EnrollmentPrompts.count()-1))).length()>16?13:15,
+                0xFFFFE5EB,true);
+            center(c,"点击『采集』后朗读，等待本地识别核对",180,323,10,0xFFC3A3AF,false);
+        }
+        box(c,20,377,172,442,enrollmentDone?0x6643212B:0xAD50263B,12);
+        center(c,"采 集",96,413,16,0xFFFFD9E4,true);
+        box(c,188,377,340,442,enrollReady?0xA04F2945:0x66301C2C,12);
+        center(c,"完 成",264,413,16,0xFFFFD9E4,true);
+        String stage=enrollmentDone?"录入结束":
+            enrollReady?"采集成功 ✓  点击『完成』进入下一条":
+            enrollmentCapturing?"正在采集 · 请朗读上方提示词…":
+            "尚未完成本条 · 请点击『采集』";
+        center(c,stage,180,468,11,enrollReady?0xFFF6C6D4:0xFFBBA2AE,false);
+        box(c,20,482,172,521,0x8D331C2E,9);
+        center(c,"取消本次",96,506,12,0xFFD9A6B8,false);
+        box(c,188,482,340,521,0x8D331C2E,9);
+        center(c,"返回语音页",264,506,12,0xFFD9A6B8,false);
+        // Matching left/right triple-tap areas remain blank (y = 532..582).
+        center(c,"左侧三击按键",85,598,9,0xFFC79EAE,false);
+        center(c,"右侧三击声纹",278,598,9,0xFFC79EAE,false);
+        box(c,20,625,340,697,0x9F251A27,11);
+        text(c,shortText(voiceStatus,39),30,644,10,0xFFF0B8CA,false);
+        text(c,shortText(lastText,37),30,661,10,0xFFFFC5D4,false);
+        text(c,shortText(ownerStatus,38),30,678,9,0xFFD2A2B7,false);
+        center(c,"整句核对 + 有效声纹才算成功 · 不发红外",180,692,8,0xFF987886,false);
+    }
+    public void openEnrollment(){
+        page=PAGE_OWNER;enrollStep=0;enrollReady=false;enrollmentDone=false;
+        enrollmentCapturing=false;lastText="按『采集』后朗读第一条提示词";invalidate();
+    }
+    public void setEnrollmentMessage(String text){lastText=text;invalidate();}
     @Override protected void onDraw(Canvas raw){
         super.onDraw(raw);
         int count=raw.save();
         raw.scale(getWidth()/(float)W,getHeight()/(float)H);
         background(raw);
         float t=(SystemClock.elapsedRealtime()-startedAt)/1000f;
-        if(manual)drawControls(raw);
+        if(page==PAGE_MANUAL)drawControls(raw);
+        else if(page==PAGE_OWNER)drawEnrollment(raw);
         else {filaments(raw,t);voicePanel(raw);}
         raw.restoreToCount(count);
         voiceLevel*=.91f;
@@ -340,27 +396,54 @@ public final class RexView extends View {
         if(e.getAction()==MotionEvent.ACTION_DOWN){downMs=SystemClock.elapsedRealtime();return true;}
         if(e.getAction()==MotionEvent.ACTION_UP){
             long now=SystemClock.elapsedRealtime();
-            // Large, practical REX-left touch area ABOVE the transcript panel.
-            // Exactly the same vacant rectangle is reserved in manual mode.
-            if(x>=22 && x<=140 && y>=517 && y<=582){
-                taps=(now-lastTapMs<730)?taps+1:1;
-                lastTapMs=now;
-                if(taps>=3){manual=!manual;taps=0;invalidate();}
+            // Symmetric large blanks immediately LEFT and RIGHT of centered REX.
+            if(y>=526 && y<=584 && x>=22 && x<=140){
+                leftTaps=(now-lastLeftTapMs<730)?leftTaps+1:1;
+                lastLeftTapMs=now;rightTaps=0;
+                if(leftTaps>=3){
+                    leftTaps=0;
+                    if(page==PAGE_OWNER)actions.onCancelVoiceEnrollment();
+                    page=(page==PAGE_MANUAL)?PAGE_VOICE:PAGE_MANUAL;
+                    invalidate();
+                }
+                return true;
+            }
+            if(y>=526 && y<=584 && x>=220 && x<=338){
+                rightTaps=(now-lastRightTapMs<730)?rightTaps+1:1;
+                lastRightTapMs=now;leftTaps=0;
+                if(rightTaps>=3){
+                    rightTaps=0;
+                    if(page==PAGE_OWNER){actions.onCancelVoiceEnrollment();page=PAGE_VOICE;}
+                    else{openEnrollment();actions.onEnrollVoice();}
+                    invalidate();
+                }
                 return true;
             }
             boolean longPress=now-downMs>1100;
-            if(!manual && x>=243 && x<=339 && y>=522 && y<=585){
-                actions.onEnrollVoice();return true;
+            if(page==PAGE_OWNER){
+                if(y>=377 && y<=442){
+                    if(x>=20 && x<=172 && !enrollReady && !enrollmentDone)
+                        actions.onCaptureVoice(enrollStep);
+                    if(x>=188 && x<=340 && enrollReady && !enrollmentDone)
+                        actions.onCompleteVoice(enrollStep);
+                    return true;
+                }
+                if(y>=482 && y<=521){
+                    if(x>=20 && x<=172){actions.onCancelVoiceEnrollment();openEnrollment();actions.onEnrollVoice();}
+                    else if(x>=188 && x<=340){actions.onCancelVoiceEnrollment();page=PAGE_VOICE;invalidate();}
+                    return true;
+                }
+                return true;
             }
-            if(!manual && x>20 && x<340 && y>668 && y<699){
+            if(page==PAGE_VOICE && x>20 && x<340 && y>668 && y<699){
                 if(longPress)actions.onStopVoice();else actions.onStartVoice();
                 return true;
             }
-            if(manual && x>20 && x<340 && y>652 && y<697){
+            if(page==PAGE_MANUAL && x>20 && x<340 && y>652 && y<697){
                 if(longPress)actions.onStopVoice();else actions.onStartVoice();
                 return true;
             }
-            if(manual)for(TouchButton b:controls)if(b.r.contains(x,y)){
+            if(page==PAGE_MANUAL)for(TouchButton b:controls)if(b.r.contains(x,y)){
                 actions.onSend(b.command);return true;
             }
             return true;

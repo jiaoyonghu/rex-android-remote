@@ -32,14 +32,16 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * REx v0.5: in-app bilingual Vosk ASR, real-time PCM-driven visualization,
- * no wake timeout and prototype local speaker enrollment. All spoken robot
+ * REx v0.6: in-app bilingual Vosk ASR, speech-likeness-gated live visuals,
+ * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
 public final class VoiceService extends Service {
     public static final String ACTION_EVENT="com.rex.remote.VOICE_EVENT";
     public static final String ACTION_STOP="com.rex.remote.STOP_VOICE";
     public static final String ACTION_ENROLL_BEGIN="com.rex.remote.ENROLL_BEGIN";
+    public static final String ACTION_ENROLL_CAPTURE="com.rex.remote.ENROLL_CAPTURE";
+    public static final String ACTION_ENROLL_NEXT="com.rex.remote.ENROLL_NEXT";
     public static final String ACTION_ENROLL_FINISH="com.rex.remote.ENROLL_FINISH";
     public static final String ACTION_ENROLL_CLEAR="com.rex.remote.ENROLL_CLEAR";
     public static final String ACTION_ENROLL_CANCEL="com.rex.remote.ENROLL_CANCEL";
@@ -53,8 +55,12 @@ public final class VoiceService extends Service {
     public static final String EXTRA_SPEAKING="speaking";
     public static final String EXTRA_OWNER="owner";
     public static final String EXTRA_ENROLL_COUNT="enroll_count";
+    public static final String EXTRA_ENROLL_STEP="enroll_step";
+    public static final String EXTRA_ENROLL_READY="enroll_ready";
+    public static final String EXTRA_ENROLL_CAPTURING="enroll_capturing";
+    public static final String EXTRA_ENROLL_EVENT="enroll_event";
 
-    private static final String CHANNEL="rex_offline_voice_v5";
+    private static final String CHANNEL="rex_offline_voice_v6";
     private static final String TAG="RExOfflineVoice";
     private static final int SAMPLE_RATE=16000;
     private static final String ZH_MODEL_ZIP="vosk-model-small-cn-0.22.zip";
@@ -74,12 +80,16 @@ public final class VoiceService extends Service {
     private Thread worker;
     private SpeakerProfile profile;
     private long lastRealtimeBroadcastMs;
+    private volatile long lastVoiceOnsetMs;
     private long lastFinalMs;
     private String lastFinalSignature="";
     private volatile long lastOwnerVerifiedMs;
-    private float noiseFloor=.0040f;
-    private int speechRise;
-    private int speechFall;
+    private final SpeechActivityGate activityGate=new SpeechActivityGate();
+    private final Object enrollLock=new Object();
+    private int enrollStep;
+    private boolean enrollArmed,enrollReady;
+    private long enrollDeadline;
+    private static final long CAPTURE_TIMEOUT_MS=19000;
     private String lastPartialSent="";
 
     @Override public void onCreate(){super.onCreate();profile=new SpeakerProfile(this);
@@ -89,26 +99,73 @@ public final class VoiceService extends Service {
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         String action=intent==null?"":intent.getAction();
         if(ACTION_STOP.equals(action)){stopSelf();return START_NOT_STICKY;}
-        if(ACTION_ENROLL_FINISH.equals(action)){
-            if(profile.finish()){
-                ownerStatus="已保存本人声纹（实验性验证）";
-                status="声纹录入完成 · 本机存储特征，未保存录音";
-            }else status="至少录入 3 段有效声音，再点击完成（当前 "+profile.sampleCount()+" 段）";
-            publish(null,null,null,false,0f);if(!running)stopSelf();return START_NOT_STICKY;
+        int requestedStep=intent==null?0:intent.getIntExtra(EXTRA_ENROLL_STEP,0);
+        if(ACTION_ENROLL_CAPTURE.equals(action)){
+            synchronized(enrollLock){
+                if(profile.isEnrolling() && requestedStep==enrollStep && !enrollReady){
+                    enrollArmed=true;
+                    enrollDeadline=SystemClock.elapsedRealtime()+CAPTURE_TIMEOUT_MS;
+                    status="正在采集第 "+(enrollStep+1)+" 条，请朗读提示词并自然停顿";
+                    publishEnrollment("CAPTURE_STARTED");
+                }else{
+                    status="采集未开始：请确认正在当前声纹提示词页面";
+                    publishEnrollment("CAPTURE_FAIL");
+                }
+            }
+            return START_NOT_STICKY;
+        }
+        if(ACTION_ENROLL_NEXT.equals(action)){
+            synchronized(enrollLock){
+                if(profile.isEnrolling() && requestedStep==enrollStep && enrollReady){
+                    enrollReady=false;enrollArmed=false;
+                    enrollStep++;
+                    if(enrollStep>=EnrollmentPrompts.count()){
+                        if(profile.finish()){
+                            ownerStatus="已保存主人声纹特征（实验性）";
+                            status="全部 "+EnrollmentPrompts.count()+" 条提示词采集成功 · 声纹录入结束";
+                            publishEnrollment("ENROLL_DONE");
+                        }else{
+                            enrollStep=EnrollmentPrompts.count()-1;
+                            enrollReady=true; // allow retry of persist without duplicate capture
+                            status="声纹保存失败，请再次点击『完成』重试保存";
+                            publishEnrollment("CAPTURE_FAIL");
+                        }
+                    }else{
+                        status="第 "+enrollStep+" 条完成 · 请点击『采集』朗读下一条";
+                        publishEnrollment("STEP_ADVANCED");
+                    }
+                }else{
+                    status="本条提示词尚未成功采集，不能完成";
+                    publishEnrollment("CAPTURE_FAIL");
+                }
+            }
+            return START_NOT_STICKY;
         }
         if(ACTION_ENROLL_CLEAR.equals(action)){
-            profile.clear();lastOwnerVerifiedMs=0;
-            ownerStatus="声纹已清除"; status="已删除本机声纹特征";
-            publish(null,null,null,false,0f);if(!running)stopSelf();return START_NOT_STICKY;
+            synchronized(enrollLock){
+                profile.clear();enrollArmed=false;enrollReady=false;enrollStep=0;
+                lastOwnerVerifiedMs=0;
+                ownerStatus="声纹已清除";status="已删除本机声纹特征";
+                publishEnrollment("ENROLL_CLEARED");
+            }
+            if(!running)stopSelf();return START_NOT_STICKY;
         }
         if(ACTION_ENROLL_CANCEL.equals(action)){
-            profile.abandon();status="已取消本次声纹录入";
-            publish(null,null,null,false,0f);if(!running)stopSelf();return START_NOT_STICKY;
+            synchronized(enrollLock){
+                profile.abandon();enrollArmed=false;enrollReady=false;enrollStep=0;
+                status="已取消本次声纹采集，原有声纹保持不变";
+                publishEnrollment("ENROLL_CANCELLED");
+            }
+            if(!running)stopSelf();return START_NOT_STICKY;
         }
         if(ACTION_ENROLL_BEGIN.equals(action)){
-            profile.begin();lastOwnerVerifiedMs=0;
-            ownerStatus="声纹录入中：0/5";
-            status="开始录入：请说完整长短句，停顿分段，共 3～5 段";
+            synchronized(enrollLock){
+                profile.begin();enrollArmed=false;enrollReady=false;enrollStep=0;
+                lastOwnerVerifiedMs=0;
+                ownerStatus="声纹录入进行中：0/"+EnrollmentPrompts.count();
+                status="声纹第 1 条：点击『采集』后朗读屏幕提示词";
+                publishEnrollment("ENROLL_BEGIN");
+            }
         }
         if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){
             status="未授权麦克风";publish(null,null,null,false,0f);
@@ -127,7 +184,7 @@ public final class VoiceService extends Service {
         try {startForeground(1001,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);}
         catch(Exception e){status="麦克风服务启动失败："+e.getClass().getSimpleName();
             publish(null,null,null,false,0f);stopSelf();return START_NOT_STICKY;}
-        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v5");worker.start();}
+        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v6");worker.start();}
         publish(null,null,null,false,0f);
         return START_NOT_STICKY;
     }
@@ -300,8 +357,18 @@ public final class VoiceService extends Service {
                 if(!running)break;
                 if(count<0)throw new IllegalStateException("mic.read failed " + count);
                 if(count==0)continue;
-                float energy=liveEnergy(rms(reusable,count));
+                float energy=activityGate.process(reusable,count);
+                boolean wasSpeaking=speaking;
+                speaking=activityGate.isActive();
                 long now=SystemClock.elapsedRealtime();
+                if(!wasSpeaking && speaking)lastVoiceOnsetMs=now;
+                synchronized(enrollLock){
+                    if(profile.isEnrolling() && enrollArmed && now>=enrollDeadline){
+                        enrollArmed=false;
+                        status="采集超时：未得到完整提示词，请点击『采集』重试";
+                        publishEnrollment("CAPTURE_FAIL");
+                    }
+                }
                 if(now-lastRealtimeBroadcastMs>=65){
                     lastRealtimeBroadcastMs=now;
                     publish(null,null,null,false,energy);
@@ -344,39 +411,39 @@ public final class VoiceService extends Service {
         try{return new JSONObject(json).optString(key,"").trim();}
         catch(Exception e){return "";}
     }
-    private static float rms(short[] data,int count){
-        double sum=0;
-        for(int i=0;i<count;i++){double x=data[i]/32768.0;sum+=x*x;}
-        return (float)Math.sqrt(sum/Math.max(1,count));
-    }
-    private float liveEnergy(float raw){
-        // Adaptive noise gate only; NOT a human-voice classifier. Very loud TV
-        // and music may still animate the visual field.
-        if(raw<noiseFloor*1.5f || (!speaking && raw<.010f))
-            noiseFloor=noiseFloor*.992f+raw*.008f;
-        noiseFloor=Math.max(.0016f,Math.min(.035f,noiseFloor));
-        float threshold=Math.max(.0052f,noiseFloor*1.75f);
-        float signal=Math.max(0f,Math.min(1f,(raw-threshold)*31f));
-        if(signal>.075f){speechRise++;speechFall=0;}
-        else {speechRise=0;speechFall++;}
-        if(speechRise>=2)speaking=true; // e.g. two 50ms packets => ~100ms onset
-        if(speechFall>=5)speaking=false;
-        return speaking?Math.min(1f,.26f+signal*1.6f):0f;
-    }
     private void consumePair(String zhText,String enText,SpeakerEvidence zhSpk,SpeakerEvidence enSpk){
         long now=SystemClock.elapsedRealtime();
         String fingerprint=RexCommand.norm(zhText)+"|"+RexCommand.norm(enText);
         if(fingerprint.equals("|") ||
-            (fingerprint.equals(lastFinalSignature) && now-lastFinalMs<1250))return;
+            (!profile.isEnrolling() && fingerprint.equals(lastFinalSignature)
+                && now-lastFinalMs<1250))return;
         lastFinalSignature=fingerprint;lastFinalMs=now;
         SpeakerEvidence ev=zhSpk;
         if(ev==null || (enSpk!=null && enSpk.frames>ev.frames))ev=enSpk;
         if(profile.isEnrolling()){
-            if(ev!=null && profile.add(ev.vector)){
-                ownerStatus="声纹录入中："+profile.sampleCount()+"/5";
-                status="成功采集第 "+profile.sampleCount()+" 段，继续说下一段或点击完成";
-            }else status="本段声音太短或声纹数据不足：再说完整的长短句";
-            publish("中: "+zhText+" | EN: "+enText,null,null,false,0f);
+            synchronized(enrollLock){
+                if(!enrollArmed || enrollReady){
+                    // Ignore ambient ASR while the user has not tapped Collect.
+                    return;
+                }
+                enrollArmed=false;
+                boolean phraseCorrect=EnrollmentPrompts.matches(enrollStep,zhText,enText);
+                boolean usableSpeaker=ev!=null;
+                String heard="中: "+zhText+" | EN: "+enText;
+                if(phraseCorrect && usableSpeaker && profile.add(ev.vector)){
+                    enrollReady=true;
+                    ownerStatus="第 "+(enrollStep+1)+"/"+EnrollmentPrompts.count()+" 条：声纹采集成功";
+                    status="采集成功：文字核对通过 + 已提取声纹；点击『完成』";
+                    publish(heard,null,null,false,0f,"CAPTURE_OK");
+                }else{
+                    if(!phraseCorrect)
+                        status="提示词不匹配：请完整朗读『"+EnrollmentPrompts.at(enrollStep)+"』";
+                    else if(!usableSpeaker)
+                        status="语音太短或声纹特征不足：请慢一点完整朗读";
+                    else status="声纹特征无效，请重试";
+                    publish(heard,null,null,false,0f,"CAPTURE_FAIL");
+                }
+            }
             return;
         }
         boolean enrolled=profile.hasProfile();
@@ -407,12 +474,20 @@ public final class VoiceService extends Service {
         // Even a matched owner embedding is insufficient for motor authorization.
         publish(match.display(),null,cmd,wakeEvent,0f);
     }
+    private void publishEnrollment(String event){
+        publish(null,null,null,false,0f,event);
+    }
     private void publish(String finalText,String partial,RexCommand command,
                          boolean wakeEvent,float realtimeLevel){
+        publish(finalText,partial,command,wakeEvent,realtimeLevel,null);
+    }
+    private void publish(String finalText,String partial,RexCommand command,
+                         boolean wakeEvent,float realtimeLevel,String enrollEvent){
         Intent i=new Intent(ACTION_EVENT).setPackage(getPackageName());
         if(finalText!=null)i.putExtra(EXTRA_TEXT,finalText);
         if(partial!=null)i.putExtra(EXTRA_PARTIAL,partial);
         if(command!=null)i.putExtra(EXTRA_COMMAND,command.name());
+        if(enrollEvent!=null)i.putExtra(EXTRA_ENROLL_EVENT,enrollEvent);
         i.putExtra(EXTRA_WAKE,wakeEvent);
         i.putExtra(EXTRA_AWAKE,awake);
         i.putExtra(EXTRA_LEVEL,realtimeLevel);
@@ -420,6 +495,11 @@ public final class VoiceService extends Service {
         i.putExtra(EXTRA_STATUS,status);
         i.putExtra(EXTRA_OWNER,ownerStatus);
         i.putExtra(EXTRA_ENROLL_COUNT,profile.sampleCount());
+        synchronized(enrollLock){
+            i.putExtra(EXTRA_ENROLL_STEP,enrollStep);
+            i.putExtra(EXTRA_ENROLL_READY,enrollReady);
+            i.putExtra(EXTRA_ENROLL_CAPTURING,enrollArmed);
+        }
         sendBroadcast(i);
     }
     @Override public void onDestroy(){
