@@ -1,49 +1,114 @@
-
-name: REx Android test APK
+name: REx Android v0.3 APK + Gitee Mirror
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-
     permissions:
       contents: read
-
     steps:
-      - name: Download REx source
+      - name: Checkout REx
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Check preinstalled Android SDK
+      - name: Check Android SDK 36 (preinstalled)
         shell: bash
         run: |
-          echo "Android SDK: $ANDROID_SDK_ROOT"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           test -f "$ANDROID_SDK_ROOT/platforms/android-36/android.jar"
           test -d "$ANDROID_SDK_ROOT/build-tools/35.0.0"
-          echo "Android SDK 36 available"
 
-      - name: Set up Gradle
+      - name: Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
 
-      - name: Build REx APK
+      - name: Compile debug APK
         run: gradle --no-daemon --stacktrace assembleDebug
 
-      - name: Upload REx APK
+      - name: Keep GitHub backup
         uses: actions/upload-artifact@v4
         with:
-          name: REX-Android-debug-APK
+          name: REX-v0.3-offline-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      - name: Mirror APK to Gitee Releases (China)
+        shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_REPOSITORY: ${{ secrets.GITEE_REPOSITORY }}
+        run: |
+          python -m pip install --disable-pip-version-check -q requests
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import requests
+
+          token = os.getenv('GITEE_TOKEN', '').strip()
+          repository = os.getenv('GITEE_REPOSITORY', '').strip().strip('/')
+          if not token or not repository or len(repository.split('/')) != 2:
+              raise SystemExit('Missing GitHub Actions secrets: GITEE_TOKEN or GITEE_REPOSITORY (user/repo)')
+
+          apk = Path('app/build/outputs/apk/debug/app-debug.apk')
+          if not apk.is_file():
+              raise SystemExit('APK missing: app/build/outputs/apk/debug/app-debug.apk')
+          if apk.stat().st_size > 95 * 1024 * 1024:
+              raise SystemExit('APK exceeds safe Gitee attachment limit (~100 MB)')
+
+          s = requests.Session()
+          s.headers.update({'Authorization': 'Bearer ' + token, 'Accept': 'application/json'})
+          base = 'https://gitee.com/api/v5/repos/' + repository
+          resp = s.get(base, timeout=45)
+          if not resp.ok:
+              raise SystemExit(f'Gitee repo lookup failed: HTTP {resp.status_code}; check repository path/token/permissions')
+          branch = resp.json().get('default_branch')
+          if not branch:
+              raise SystemExit('Gitee mirror repository has no default branch: initialize it with a README')
+
+          tag = 'rex-apk-gh-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+          release = s.post(base + '/releases', data={
+              'tag_name': tag,
+              'target_commitish': branch,
+              'name': 'REx Android APK ' + tag,
+              'body': 'Only built APK is mirrored. Original GitHub source remains private.',
+              'prerelease': 'true',
+          }, timeout=60)
+          if not release.ok:
+              raise SystemExit(f'Gitee release creation failed: HTTP {release.status_code}; verify token projects permission')
+          release_id = release.json()['id']
+
+          filename = 'REX-' + tag + '.apk'
+          with apk.open('rb') as f:
+              upload = s.post(
+                  f'{base}/releases/{release_id}/attach_files',
+                  files={'file': (filename, f, 'application/vnd.android.package-archive')},
+                  timeout=(45, 1800),
+              )
+          if not upload.ok:
+              raise SystemExit(f'Gitee APK attachment failed: HTTP {upload.status_code}; check size and quota')
+          result = upload.json()
+          url = result.get('browser_download_url') or result.get('download_url')
+          fallback = f'https://gitee.com/{repository}/releases'
+          sha256 = hashlib.sha256(apk.read_bytes()).hexdigest()
+          print('Gitee release page:', fallback)
+          if url:
+              print('Gitee APK download URL:', url)
+          print('SHA256:', sha256)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as out:
+              out.write('## REx 国内 APK 镜像\n\n')
+              out.write(f'[Gitee 发行版页面]({fallback})\n\n')
+              if url:
+                  out.write(f'[下载 APK]({url})\n\n')
+              out.write(f'APK SHA256: `{sha256}`\n')
+          PY
