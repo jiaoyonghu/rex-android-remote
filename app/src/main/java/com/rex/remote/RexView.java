@@ -228,8 +228,9 @@ public final class RexView extends View {
             xs[i]=xx;ys[i]=yy;
             float near=Math.max(0f,Math.min(1f,(sz+1f)*.5f));
             float brightness=inner?1.27f:1.15f;
-            int alpha=Math.max(0,Math.min(235,(int)((inner?66:48)
-                + (inner?158:146)*near)*a.brightness*brightness));
+            int alpha = Math.max(0, Math.min(235,
+                Math.round(((inner ? 66 : 48) + (inner ? 158 : 146) * near)
+                    * a.brightness * brightness)));
             int red=255;
             int green=inner?(100+(int)(76*near)):(70+(int)(67*near));
             int blue=inner?(130+(int)(72*near)):(100+(int)(51*near));
