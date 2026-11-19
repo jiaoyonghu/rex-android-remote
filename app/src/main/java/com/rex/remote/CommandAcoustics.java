@@ -38,8 +38,8 @@ public final class CommandAcoustics {
             energies[b]=Math.sqrt(sum/Math.max(1,to-from));
             peak=Math.max(peak,energies[b]);
         }
-        if(peak<.005)return null;
-        double boundary=Math.max(.004,peak*.14);
+        if(peak<.0018)return null; // permit quieter distant speech; rejection still depends on phonetic match
+        double boundary=Math.max(.0016,peak*.14);
         int first=0,last=blocks-1;
         while(first<blocks && energies[first]<boundary)first++;
         while(last>=first && energies[last]<boundary)last--;
@@ -112,6 +112,16 @@ public final class CommandAcoustics {
         if(a==null||b==null||a.length<8||b.length<8)return Float.POSITIVE_INFINITY;
         int n=a.length,m=b.length;
         if(Math.max(n,m)>Math.min(n,m)*2.15f)return Float.POSITIVE_INFINITY;
+        // Robust to phone distance/gain and room coloration, including legacy
+        // v0.7 saved features: compensate most constant cepstral offset at
+        // comparison time so old samples remain readable and useful.
+        float[] bias=new float[FEATURES];
+        for(int k=0;k<FEATURES;k++){
+            double am=0,bm=0;
+            for(float[] row:a)am+=row[k];
+            for(float[] row:b)bm+=row[k];
+            bias[k]=(float)((am/n-bm/m)*.30);
+        }
         float[] previous=new float[m+1],next=new float[m+1];
         java.util.Arrays.fill(previous,Float.POSITIVE_INFINITY);previous[0]=0;
         for(int i=1;i<=n;i++){
@@ -123,7 +133,7 @@ public final class CommandAcoustics {
             for(int j=lo;j<=hi;j++){
                 float d=0;
                 for(int k=0;k<FEATURES;k++){
-                    float diff=a[i-1][k]-b[j-1][k];d+=diff*diff;
+                    float diff=a[i-1][k]-b[j-1][k]-bias[k];d+=diff*diff;
                 }
                 d=(float)Math.sqrt(d/FEATURES);
                 float prev=Math.min(previous[j-1],Math.min(previous[j],next[j-1]));

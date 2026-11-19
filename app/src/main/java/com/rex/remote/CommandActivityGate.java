@@ -6,9 +6,10 @@ package com.rex.remote;
  * capture noise/music; template rejection and the ASR whitelist remain vital.
  */
 public final class CommandActivityGate {
-    private float floor=.0025f;
+    private float floor=.0018f;
     private int start,end;
     private boolean active;
+    public void reset(){start=0;end=0;active=false;}
     public boolean accept(short[] pcm,int count,boolean voiceLike){
         if(count<160)return false;
         double sum=0;
@@ -16,10 +17,10 @@ public final class CommandActivityGate {
             float s=pcm[i]/32768f;sum+=s*s;
         }
         float rms=(float)Math.sqrt(sum/count);
-        if(!active && !voiceLike && rms<floor*2.3f)
+        if(!active && !voiceLike && rms<floor*2.0f)
             floor=.993f*floor+.007f*rms;
-        floor=Math.max(.0012f,Math.min(.02f,floor));
-        boolean loud=voiceLike || rms>Math.max(.0035f,floor*1.85f);
+        floor=Math.max(.0008f,Math.min(.02f,floor));
+        boolean loud=voiceLike || rms>Math.max(.0020f,floor*1.65f);
         if(loud){start++;end=0;}
         else{end++;start=0;}
         if(!active&&start>=2)active=true;

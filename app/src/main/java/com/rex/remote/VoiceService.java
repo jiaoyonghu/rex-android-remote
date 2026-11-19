@@ -32,7 +32,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * REx v0.7: in-app bilingual Vosk ASR + per-phrase learned acoustic templates,
+ * REx v0.8: unified utterance-level bilingual ASR + grammar + personal templates,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
@@ -69,7 +69,7 @@ public final class VoiceService extends Service {
     public static final String EXTRA_ENROLL_CAPTURING="enroll_capturing";
     public static final String EXTRA_ENROLL_EVENT="enroll_event";
 
-    private static final String CHANNEL="rex_offline_voice_v7";
+    private static final String CHANNEL="rex_offline_voice_v7"; // keep notification channel
     private static final String TAG="RExOfflineVoice";
     private static final int SAMPLE_RATE=16000;
     private static final String ZH_MODEL_ZIP="vosk-model-small-cn-0.22.zip";
@@ -91,14 +91,12 @@ public final class VoiceService extends Service {
     private CommandTemplateStore templates;
     private volatile boolean trainingMode,trainingArmed;
     private volatile int trainingPhrase;
+    private volatile int trainingCount;
     private volatile long trainingDeadline;
     private volatile String trainingInfo="当前口令未训练 · 至少采集 3 次";
-    private final ArrayBlockingQueue<CommandClip> commandClips=new ArrayBlockingQueue<>(5);
-    private long lastAsrMatchMs;
-    private CommandTemplateStore.Result pendingTemplate;
-    private long pendingTemplateAt;
+    private final ArrayBlockingQueue<CommandClip> commandClips=new ArrayBlockingQueue<>(8);
+    private volatile long captureGeneration;
     private long lastRealtimeBroadcastMs;
-    private volatile long lastVoiceOnsetMs;
     private long lastFinalMs;
     private String lastFinalSignature="";
     private volatile long lastOwnerVerifiedMs;
@@ -108,10 +106,10 @@ public final class VoiceService extends Service {
     private boolean enrollArmed,enrollReady;
     private long enrollDeadline;
     private static final long CAPTURE_TIMEOUT_MS=19000;
-    private String lastPartialSent="";
 
     @Override public void onCreate(){super.onCreate();profile=new SpeakerProfile(this);templates=new CommandTemplateStore(this);
         if(profile.hasProfile())ownerStatus="已录入声纹 · 待验证";
+        trainingCount=templates.count(0);
     }
 
     @Override public int onStartCommand(Intent intent,int flags,int startId){
@@ -121,10 +119,11 @@ public final class VoiceService extends Service {
         int requestedPhrase=intent==null?0:intent.getIntExtra(EXTRA_TRAIN_INDEX,0);
         if(ACTION_TRAIN_BEGIN.equals(action)||ACTION_TRAIN_SELECT.equals(action)){
             trainingMode=true;trainingArmed=false;
-            commandClips.clear();pendingTemplate=null;
+            commandClips.clear();captureGeneration++;
             trainingPhrase=Math.max(0,Math.min(CommandPhrases.count()-1,requestedPhrase));
+            trainingCount=templates.count(trainingPhrase);
             trainingInfo="『"+CommandPhrases.at(trainingPhrase)+"』已录 "
-                +templates.count(trainingPhrase)+" / 5 次 · 至少 3 次";
+                +trainingCount+" / 5 次 · 至少 3 次";
             status="指令个性化训练 · 录音仅保留声学特征，不存原始音频";
             publishTraining("TRAIN_SELECTED");
         }
@@ -136,7 +135,7 @@ public final class VoiceService extends Service {
                 trainingInfo="本条已采集 5 次，请切换指令或清除后重录";
                 publishTraining("TRAIN_FAIL");
             }else{
-                trainingArmed=true;
+                trainingArmed=true;captureGeneration++;
                 trainingDeadline=SystemClock.elapsedRealtime()+12000;
                 trainingInfo="正在采集『"+CommandPhrases.at(trainingPhrase)+"』，请说一次并停顿";
                 publishTraining("TRAIN_LISTEN");
@@ -145,7 +144,7 @@ public final class VoiceService extends Service {
         }
         if(ACTION_TRAIN_CLEAR.equals(action)){
             if(trainingMode && requestedPhrase==trainingPhrase){
-                templates.clear(trainingPhrase);trainingArmed=false;
+                templates.clear(trainingPhrase);trainingCount=0;trainingArmed=false;
                 trainingInfo="本条已清空，请点击『采集』重新朗读";
                 publishTraining("TRAIN_CLEARED");
             }
@@ -153,7 +152,7 @@ public final class VoiceService extends Service {
         }
         if(ACTION_TRAIN_END.equals(action)){
             trainingMode=false;trainingArmed=false;
-            commandClips.clear();pendingTemplate=null;
+            commandClips.clear();captureGeneration++;
             trainingInfo="已退出指令训练 · 已录样本保存在本机";
             publishTraining("TRAIN_EXIT");
             return START_NOT_STICKY;
@@ -161,7 +160,7 @@ public final class VoiceService extends Service {
         if(ACTION_ENROLL_CAPTURE.equals(action)){
             synchronized(enrollLock){
                 if(profile.isEnrolling() && requestedStep==enrollStep && !enrollReady){
-                    enrollArmed=true;
+                    enrollArmed=true;captureGeneration++;
                     enrollDeadline=SystemClock.elapsedRealtime()+CAPTURE_TIMEOUT_MS;
                     status="正在采集第 "+(enrollStep+1)+" 条，请朗读提示词并自然停顿";
                     publishEnrollment("CAPTURE_STARTED");
@@ -183,9 +182,8 @@ public final class VoiceService extends Service {
                             status="全部 "+EnrollmentPrompts.count()+" 条提示词采集成功 · 声纹录入结束";
                             publishEnrollment("ENROLL_DONE");
                         }else{
-                            enrollStep=EnrollmentPrompts.count()-1;
-                            enrollReady=true; // allow retry of persist without duplicate capture
-                            status="声纹保存失败，请再次点击『完成』重试保存";
+                            profile.abandon();enrollStep=0;enrollReady=false;
+                            status="五条声纹内部一致性或保存未通过；请重新开始声纹录入（旧档案保留）";
                             publishEnrollment("CAPTURE_FAIL");
                         }
                     }else{
@@ -201,6 +199,7 @@ public final class VoiceService extends Service {
         }
         if(ACTION_ENROLL_CLEAR.equals(action)){
             synchronized(enrollLock){
+                captureGeneration++;commandClips.clear();
                 profile.clear();enrollArmed=false;enrollReady=false;enrollStep=0;
                 lastOwnerVerifiedMs=0;
                 ownerStatus="声纹已清除";status="已删除本机声纹特征";
@@ -210,6 +209,7 @@ public final class VoiceService extends Service {
         }
         if(ACTION_ENROLL_CANCEL.equals(action)){
             synchronized(enrollLock){
+                captureGeneration++;commandClips.clear();
                 profile.abandon();enrollArmed=false;enrollReady=false;enrollStep=0;
                 status="已取消本次声纹采集，原有声纹保持不变";
                 publishEnrollment("ENROLL_CANCELLED");
@@ -218,6 +218,7 @@ public final class VoiceService extends Service {
         }
         if(ACTION_ENROLL_BEGIN.equals(action)){
             synchronized(enrollLock){
+                captureGeneration++;commandClips.clear();
                 profile.begin();enrollArmed=false;enrollReady=false;enrollStep=0;
                 lastOwnerVerifiedMs=0;
                 ownerStatus="声纹录入进行中：0/"+EnrollmentPrompts.count();
@@ -242,7 +243,7 @@ public final class VoiceService extends Service {
         try {startForeground(1001,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);}
         catch(Exception e){status="麦克风服务启动失败："+e.getClass().getSimpleName();
             publish(null,null,null,false,0f);stopSelf();return START_NOT_STICKY;}
-        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v7");worker.start();}
+        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v8");worker.start();}
         publish(null,null,null,false,0f);
         return START_NOT_STICKY;
     }
@@ -251,48 +252,21 @@ public final class VoiceService extends Service {
         publish(null,null,null,false,0f,null,event);
     }
     private static final class CommandClip {
-        final short[] pcm; final int phrase;
-        CommandClip(short[] pcm,int phrase){this.pcm=pcm;this.phrase=phrase;}
-    }
-    private void handleClip(CommandClip clip){
-        if(clip.phrase>=0){
-            String failure=templates.add(clip.phrase,clip.pcm);
-            if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
-            else{
-                int n=templates.count(clip.phrase);
-                trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』采集成功 " + n
-                    +"/5" + (n>=3 ? " · 已可参与训练辅助识别" : " · 还需至少 "+(3-n)+" 次");
-                publishTraining("TRAIN_OK");
-            }
-        }else if(!trainingMode){
-            CommandTemplateStore.Result result=templates.match(clip.pcm);
-            if(result.accepted()){
-                pendingTemplate=result;
-                pendingTemplateAt=SystemClock.elapsedRealtime();
-            }
+        final short[] pcm;final int phrase;final long generation;
+        CommandClip(short[] audio,int phrase,long generation){
+            pcm=audio;this.phrase=phrase;this.generation=generation;
         }
     }
-    private void handlePendingTemplate(){
-        if(pendingTemplate==null || trainingMode)return;
-        long now=SystemClock.elapsedRealtime();
-        if(now-pendingTemplateAt<1150)return; // let CN+EN ASR finish first
-        CommandTemplateStore.Result result=pendingTemplate;
-        pendingTemplate=null;
-        if(now-lastAsrMatchMs<1500)return;
-        RexCommand c=CommandPhrases.command(result.index);
-        if(c==null)return;
-        if(c==RexCommand.WAKE){awake=true;
-            status="训练模板识别唤醒『"+CommandPhrases.at(result.index)+"』 · 持续唤醒直到睡觉";
-            publish("个性化训练命中："+CommandPhrases.at(result.index),null,null,true,0f);
-        }else if(c==RexCommand.SLEEP){
-            if(!awake)return;
-            awake=false;lastOwnerVerifiedMs=0;
-            status="训练模板识别『睡觉』 · 返回待机";
-            publish("个性化训练命中：睡觉",null,c,false,0f);
-        }else if(awake){
-            status="训练模板辅助识别『"+CommandPhrases.at(result.index)
-                +"』 · 仅界面显示，语音红外未授权";
-            publish("个性化训练命中："+CommandPhrases.at(result.index),null,c,false,0f);
+    private void handleTrainingClip(CommandClip clip){
+        if(!trainingMode || clip.phrase!=trainingPhrase)return;
+        String failure=templates.add(clip.phrase,clip.pcm);
+        if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
+        else {
+            int n=templates.count(clip.phrase);trainingCount=n;
+            trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』采集 " + n
+                +"/5"+(n>=3?" · 已自动参与每次完整语音匹配（不是训练 Vosk）":
+                " · 再采 "+(3-n)+" 次才生效");
+            publishTraining("TRAIN_OK");
         }
     }
 
@@ -357,6 +331,50 @@ public final class VoiceService extends Service {
         return dest;
     }
 
+    private static final class OptionalGrammar implements AutoCloseable {
+        final Recognizer recognizer;
+        OptionalGrammar(Model model,String grammar,String language){
+            Recognizer result=null;
+            try{result=new Recognizer(model,SAMPLE_RATE,grammar);}
+            catch(Exception e){Log.w(TAG,language+"受限语法不可用，继续使用通用识别与训练模板",e);}
+            recognizer=result;
+        }
+        @Override public void close(){if(recognizer!=null)recognizer.close();}
+    }
+    private static final class Decoded {
+        final String text;final SpeakerEvidence speaker;
+        Decoded(String text,SpeakerEvidence speaker){this.text=text;this.speaker=speaker;}
+    }
+    /** Decode one whole clipped utterance, avoiding mismatched ASR/template timestamps. */
+    private static Decoded decodeClip(Recognizer recognizer,short[] samples) {
+        recognizer.reset();
+        StringBuilder words=new StringBuilder();
+        SpeakerEvidence evidence=null;
+        for(int start=0;start<samples.length;start+=1600){
+            int length=Math.min(1600,samples.length-start);
+            short[] frame=new short[length];
+            System.arraycopy(samples,start,frame,0,length);
+            if(recognizer.acceptWaveForm(frame,length)){
+                String json=recognizer.getResult();
+                String text=getText(json,"text");
+                if(!text.isEmpty()){
+                    if(words.length()>0)words.append(' ');
+                    words.append(text);
+                }
+                SpeakerEvidence e=evidenceFrom(json);
+                if(e!=null && (evidence==null || e.frames>evidence.frames))evidence=e;
+            }
+        }
+        String json=recognizer.getFinalResult();
+        String text=getText(json,"text");
+        if(!text.isEmpty()){
+            if(words.length()>0)words.append(' ');
+            words.append(text);
+        }
+        SpeakerEvidence e=evidenceFrom(json);
+        if(e!=null && (evidence==null || e.frames>evidence.frames))evidence=e;
+        return new Decoded(words.toString().trim(),evidence);
+    }
     private void recognitionLoop(){
         try {
             File zhDir=unpackBundledModel(ZH_MODEL_ZIP,ZH_MODEL_FOLDER,"中文");
@@ -365,12 +383,14 @@ public final class VoiceService extends Service {
             if(!running)return;
             File speakerDir=unpackBundledModel(SPEAKER_ZIP,SPEAKER_FOLDER,"声纹");
             if(!running)return;
-            updateStatus("正在加载中文 + 英文 + 声纹 3 套离线模型…");
+            updateStatus("正在加载双语离线识别 + 固定词表 + 声纹模型…");
             try(Model zhModel=new Model(zhDir.getAbsolutePath());
                 Model enModel=new Model(enDir.getAbsolutePath());
                 SpeakerModel speakerModel=new SpeakerModel(speakerDir.getAbsolutePath());
                 Recognizer zh=new Recognizer(zhModel,SAMPLE_RATE);
-                Recognizer en=new Recognizer(enModel,SAMPLE_RATE)) {
+                Recognizer en=new Recognizer(enModel,SAMPLE_RATE);
+                OptionalGrammar focusedZh=new OptionalGrammar(zhModel,VoskGrammar.chinese(),"中文");
+                OptionalGrammar focusedEn=new OptionalGrammar(enModel,VoskGrammar.english(),"英文")) {
                 zh.setSpeakerModel(speakerModel);
                 en.setSpeakerModel(speakerModel);
                 int minimum=AudioRecord.getMinBufferSize(SAMPLE_RATE,
@@ -388,58 +408,41 @@ public final class VoiceService extends Service {
                     try{if(NoiseSuppressor.isAvailable()){
                         ns=NoiseSuppressor.create(mic.getAudioSessionId());
                         if(ns!=null)ns.setEnabled(true);
-                    }}catch(Exception e){Log.w(TAG,"NoiseSuppressor unavailable",e);}
+                    }}catch(Exception ex){Log.w(TAG,"NoiseSuppressor unavailable",ex);}
                     try{if(AutomaticGainControl.isAvailable()){
                         agc=AutomaticGainControl.create(mic.getAudioSessionId());
                         if(agc!=null)agc.setEnabled(true);
-                    }}catch(Exception e){Log.w(TAG,"AGC unavailable",e);}
+                    }}catch(Exception ex){Log.w(TAG,"AGC unavailable",ex);}
                     mic.startRecording();
-                    updateStatus("离线实时监听 · 叫 Rex 或 灭建国 唤醒");
-                    // Audio capture is a SEPARATE thread from the potentially
-                    // expensive CN/EN decoders. PCM animation runs even if ASR lags.
-                    ArrayBlockingQueue<short[]> audioQueue=new ArrayBlockingQueue<>(32);
-                    Thread capture=new Thread(()->capturePcm(mic,audioQueue),"rex-live-mic");
+                    updateStatus("离线监听中 · 通用+词表+训练样本统一裁决 · 仅预览");
+                    Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic");
                     capture.start();
-                    String finalZh="",finalEn="";
-                    SpeakerEvidence zhSpk=null,enSpk=null;
-                    boolean endedZh=false,endedEn=false;
-                    long pendingSince=0;
-                    String latestZhPartial="",latestEnPartial="";
                     while(running){
-                        CommandClip newClip;
-                        while((newClip=commandClips.poll())!=null)handleClip(newClip);
-                        handlePendingTemplate();
-                        short[] samples=audioQueue.poll(200,TimeUnit.MILLISECONDS);
-                        if(!running)break;
-                        if(samples==null)continue;
-                        int count=samples.length;
-                        long now=SystemClock.elapsedRealtime();
-                        // Decode audio from the queue; visualization is independent.
-                        boolean zhDone=zh.acceptWaveForm(samples,count);
-                        boolean enDone=en.acceptWaveForm(samples,count);
-                        if(zhDone){
-                            String raw=zh.getResult();finalZh=getText(raw,"text");
-                            zhSpk=evidenceFrom(raw);endedZh=true;latestZhPartial="";
-                        }else if(!endedZh)latestZhPartial=getText(zh.getPartialResult(),"partial");
-                        if(enDone){
-                            String raw=en.getResult();finalEn=getText(raw,"text");
-                            enSpk=evidenceFrom(raw);endedEn=true;latestEnPartial="";
-                        }else if(!endedEn)latestEnPartial=getText(en.getPartialResult(),"partial");
-                        if((zhDone||enDone) && pendingSince==0)pendingSince=now;
-                        String partial=!latestZhPartial.isEmpty()?"中: "+latestZhPartial:
-                            (!latestEnPartial.isEmpty()?"EN: "+latestEnPartial:"");
-                        if(!partial.isEmpty() && !partial.equals(lastPartialSent)){
-                            lastPartialSent=partial;
-                            publish(null,partial,null,false,0f);
+                        CommandClip clip=commandClips.poll(250,TimeUnit.MILLISECONDS);
+                        if(!running || clip==null)continue;
+                        if(clip.generation!=captureGeneration)continue;
+                        if(clip.phrase>=0){handleTrainingClip(clip);continue;}
+                        if(trainingMode)continue;
+                        synchronized(enrollLock){
+                            if(profile.isEnrolling() && !enrollArmed)continue;
                         }
-                        if(pendingSince>0 && ((endedZh && endedEn)||now-pendingSince>=750)){
-                            String z=endedZh?finalZh:latestZhPartial;
-                            String e=endedEn?finalEn:latestEnPartial;
-                            if(!z.isEmpty() || !e.isEmpty())consumePair(z,e,zhSpk,enSpk);
-                            finalZh="";finalEn="";zhSpk=null;enSpk=null;
-                            endedZh=false;endedEn=false;pendingSince=0;
-                            latestZhPartial="";latestEnPartial="";lastPartialSent="";
+                        // Fast path for enrollment: only the full-vocabulary recognizers.
+                        Decoded cn=decodeClip(zh,clip.pcm);
+                        Decoded english=decodeClip(en,clip.pcm);
+                        if(clip.generation!=captureGeneration)continue;
+                        if(profile.isEnrolling()) {
+                            consumeUtterance(cn.text,english.text,"","",cn.speaker,
+                                english.speaker,null);
+                            continue;
                         }
+                        Decoded focusedCn=focusedZh.recognizer==null?new Decoded("",null):
+                            decodeClip(focusedZh.recognizer,clip.pcm);
+                        Decoded focusedEnglish=focusedEn.recognizer==null?new Decoded("",null):
+                            decodeClip(focusedEn.recognizer,clip.pcm);
+                        if(clip.generation!=captureGeneration)continue;
+                        CommandTemplateStore.Result result=templates.match(clip.pcm);
+                        consumeUtterance(cn.text,english.text,focusedCn.text,
+                            focusedEnglish.text,cn.speaker,english.speaker,result);
                     }
                 }finally{
                     try{mic.stop();}catch(Exception ignored){}
@@ -448,31 +451,34 @@ public final class VoiceService extends Service {
                     mic.release();recording=null;
                 }
             }
-        }catch(Exception e){
+        }catch(Exception ex){
             if(!running)return;
-            Log.e(TAG,"REx Vosk recording failure",e);
-            status="离线语音失败："+e.getClass().getSimpleName()+" "+String.valueOf(e.getMessage());
+            Log.e(TAG,"REx Vosk audio pipeline failed",ex);
+            status="离线语音失败："+ex.getClass().getSimpleName()+" "+String.valueOf(ex.getMessage());
             publish(null,null,null,false,0f);
             running=false;stopSelf();
         }
     }
 
     /** Real-time PCM thread: samples + publishes level BEFORE any ASR decoding. */
-    private void capturePcm(AudioRecord mic,ArrayBlockingQueue<short[]> queue){
+    private void capturePcm(AudioRecord mic){
         short[] reusable=new short[800]; // 50ms, 16kHz mono
         CommandAudioSegmenter segmenter=new CommandAudioSegmenter();
         CommandActivityGate commandGate=new CommandActivityGate();
+        long seenGeneration=-1;
         try{
             while(running){
+                if(seenGeneration!=captureGeneration){
+                    segmenter.reset();commandGate.reset();
+                    seenGeneration=captureGeneration;
+                }
                 int count=mic.read(reusable,0,reusable.length,AudioRecord.READ_BLOCKING);
                 if(!running)break;
                 if(count<0)throw new IllegalStateException("mic.read failed " + count);
                 if(count==0)continue;
                 float energy=activityGate.process(reusable,count);
-                boolean wasSpeaking=speaking;
                 speaking=activityGate.isActive();
                 long now=SystemClock.elapsedRealtime();
-                if(!wasSpeaking && speaking)lastVoiceOnsetMs=now;
                 if(trainingArmed && now>trainingDeadline){
                     trainingArmed=false;trainingInfo="采集超时：没有完成一次有效的朗读，请重试";
                     publishTraining("TRAIN_FAIL");
@@ -488,9 +494,10 @@ public final class VoiceService extends Service {
                         else utterance=null;
                     }
                     if(utterance!=null){
-                        CommandClip clip=new CommandClip(utterance,phrase);
+                        CommandClip clip=new CommandClip(utterance,phrase,seenGeneration);
                         if(!commandClips.offer(clip)){
                             commandClips.poll();commandClips.offer(clip);
+                            status="语音解码负载偏高，已丢弃最早一段；请稍放慢指令节奏";
                         }
                     }
                 }
@@ -504,12 +511,6 @@ public final class VoiceService extends Service {
                 if(now-lastRealtimeBroadcastMs>=65){
                     lastRealtimeBroadcastMs=now;
                     publish(null,null,null,false,energy);
-                }
-                short[] samples=new short[count];
-                System.arraycopy(reusable,0,samples,0,count);
-                if(!queue.offer(samples)){
-                    // Avoid indefinite stale audio: drop one OLD frame under load.
-                    queue.poll();queue.offer(samples);
                 }
             }
         }catch(Exception e){
@@ -543,71 +544,77 @@ public final class VoiceService extends Service {
         try{return new JSONObject(json).optString(key,"").trim();}
         catch(Exception e){return "";}
     }
-    private void consumePair(String zhText,String enText,SpeakerEvidence zhSpk,SpeakerEvidence enSpk){
+    private void consumeUtterance(String zhText,String enText,String grammarZh,
+                                  String grammarEn,SpeakerEvidence zhSpk,
+                                  SpeakerEvidence enSpk,CommandTemplateStore.Result personal){
         if(trainingMode)return;
         long now=SystemClock.elapsedRealtime();
-        String fingerprint=RexCommand.norm(zhText)+"|"+RexCommand.norm(enText);
-        if(fingerprint.equals("|") ||
-            (!profile.isEnrolling() && fingerprint.equals(lastFinalSignature)
-                && now-lastFinalMs<1250))return;
-        lastFinalSignature=fingerprint;lastFinalMs=now;
         SpeakerEvidence ev=zhSpk;
         if(ev==null || (enSpk!=null && enSpk.frames>ev.frames))ev=enSpk;
         if(profile.isEnrolling()){
             synchronized(enrollLock){
-                if(!enrollArmed || enrollReady){
-                    // Ignore ambient ASR while the user has not tapped Collect.
-                    return;
-                }
+                if(!enrollArmed || enrollReady)return;
                 enrollArmed=false;
                 boolean phraseCorrect=EnrollmentPrompts.matches(enrollStep,zhText,enText);
                 boolean usableSpeaker=ev!=null;
                 String heard="中: "+zhText+" | EN: "+enText;
                 if(phraseCorrect && usableSpeaker && profile.add(ev.vector)){
                     enrollReady=true;
-                    ownerStatus="第 "+(enrollStep+1)+"/"+EnrollmentPrompts.count()+" 条：声纹采集成功";
-                    status="采集成功：文字核对通过 + 已提取声纹；点击『完成』";
+                    ownerStatus="第 "+(enrollStep+1)+"/"+EnrollmentPrompts.count()+" 条：声纹采集有效";
+                    status="文字核对及声纹一致性初检通过 · 点击『完成』";
                     publish(heard,null,null,false,0f,"CAPTURE_OK");
                 }else{
-                    if(!phraseCorrect)
-                        status="提示词不匹配：请完整朗读『"+EnrollmentPrompts.at(enrollStep)+"』";
-                    else if(!usableSpeaker)
-                        status="语音太短或声纹特征不足：请慢一点完整朗读";
-                    else status="声纹特征无效，请重试";
+                    if(!phraseCorrect)status="提示词未核对通过，请完整念『"+EnrollmentPrompts.at(enrollStep)+"』";
+                    else if(!usableSpeaker)status="声纹特征不足：请完整、稍慢地朗读较长句";
+                    else status="这一段声纹与之前录入的声音差异太大，请重新录制";
                     publish(heard,null,null,false,0f,"CAPTURE_FAIL");
                 }
             }
             return;
         }
-        boolean enrolled=profile.hasProfile();
-        if(enrolled){
+        if(profile.hasProfile()){
             if(ev!=null){
-                float score=profile.score(ev.vector);
-                if(profile.matches(ev.vector)){
-                    lastOwnerVerifiedMs=now;
-                    ownerStatus="声纹匹配（实验性）相似度 "+Math.round(score*100)+"%";
-                }else ownerStatus="声纹不匹配（实验性）相似度 "+Math.round(score*100)+"%";
+                SpeakerProfile.Match m=profile.verify(ev.vector);
+                if(m.verified)lastOwnerVerifiedMs=now;
+                ownerStatus=(m.verified?"声纹相符":"声纹不符")+"（实验性）相似度 "
+                    +String.format(java.util.Locale.ROOT,"%.2f",m.similarity)
+                    +" · 门槛 "+String.format(java.util.Locale.ROOT,"%.2f",m.threshold)
+                    +(m.calibrated?" · 已个人校准":" · 旧档案建议重录");
             }else if(now-lastOwnerVerifiedMs<180000 && lastOwnerVerifiedMs>0)
-                ownerStatus="本句较短 · 沿用 3 分钟内声纹验证";
-            else ownerStatus="本句太短无法验证声纹 · 请先说一段较长的本人语音";
-        }else ownerStatus="尚未录入声纹 · 仅演示识别";
+                ownerStatus="本句短，无法独立确认声纹；之前曾相符（不作为授权）";
+            else ownerStatus="本句缺少足够声纹特征，不代表不是本人";
+        }else ownerStatus="尚未录入声纹 · 仅预览识别";
 
-        BilingualCommandRouter.Match match=BilingualCommandRouter.resolve(zhText,enText,awake);
-        boolean wakeEvent=false;
-        if(match.woke){
-            // Even when already awake, saying wake in MANUAL mode returns to orb.
-            awake=true; wakeEvent=true;
+        SpeechFusion.Decision decision=SpeechFusion.decide(
+            zhText,enText,grammarZh,grammarEn,personal,awake);
+        String diagnostic=personal==null?"无模板结果":personal.diagnostic();
+        RexCommand cmd=decision.command;
+        boolean wakeEvent=decision.woke;
+        String signature=decision.origin+"|"+cmd+"|"+wakeEvent+"|"+RexCommand.norm(zhText)
+            +"|"+RexCommand.norm(enText);
+        if(signature.equals(lastFinalSignature)&&now-lastFinalMs<550)return;
+        lastFinalSignature=signature;lastFinalMs=now;
+        String transcribed="中: "+zhText+" | EN: "+enText;
+        if(!grammarZh.isEmpty()||!grammarEn.isEmpty())
+            transcribed+=" | 词表中: "+grammarZh+" / EN: "+grammarEn;
+        if(decision.conflict){
+            status="不同动作冲突，拒绝猜测 · "+decision.reason+" · "+diagnostic;
+            cmd=null;wakeEvent=false;
+        }else if(wakeEvent){
+            awake=true;
+            status="REx 已唤醒 · 来源 "+decision.origin+" · "+diagnostic;
+        }else if(cmd==RexCommand.SLEEP){
+            awake=false;lastOwnerVerifiedMs=0;
+            status="已听到睡觉 · 来源 "+decision.origin+" · 返回待机 · "+diagnostic;
+        }else if(cmd!=null){
+            status="识别「"+cmd.label+"」· 来源 "+decision.origin
+                +" · "+diagnostic+" · 仅预览，不发运动红外";
+        }else{
+            status=(awake?"保持唤醒":"待机等待唤醒")+" · "+decision.reason+" · "+diagnostic;
         }
-        RexCommand cmd=match.command;
-        if(match.woke||cmd!=null){lastAsrMatchMs=now;pendingTemplate=null;}
-        if(cmd==RexCommand.SLEEP){awake=false;lastOwnerVerifiedMs=0;
-            status="已听到『睡觉』 · 智能体进入待机（麦克风继续监听）";
-        }else if(match.woke){status="REx 已唤醒 · 永不自动休眠 · 说『睡觉』休眠";}
-        else if(cmd!=null)status="白名单指令 "+cmd.label+" · 仅显示，尚未开放语音红外";
-        else status=awake?"保持唤醒 · 本句不是白名单指令":"待机中 · 等待 Rex / Rex醒了吗 / 灭建国";
-        // Even a matched owner embedding is insufficient for motor authorization.
-        publish(match.display(),null,cmd,wakeEvent,0f);
+        publish(transcribed,null,cmd,wakeEvent,0f);
     }
+
     private void publishEnrollment(String event){
         publish(null,null,null,false,0f,event);
     }
@@ -628,7 +635,7 @@ public final class VoiceService extends Service {
         if(enrollEvent!=null)i.putExtra(EXTRA_ENROLL_EVENT,enrollEvent);
         if(trainEvent!=null)i.putExtra(EXTRA_TRAIN_EVENT,trainEvent);
         i.putExtra(EXTRA_TRAIN_INDEX,trainingPhrase);
-        i.putExtra(EXTRA_TRAIN_COUNT,templates.count(trainingPhrase));
+        i.putExtra(EXTRA_TRAIN_COUNT,trainingCount);
         i.putExtra(EXTRA_TRAIN_INFO,trainingInfo);
         i.putExtra(EXTRA_WAKE,wakeEvent);
         i.putExtra(EXTRA_AWAKE,awake);

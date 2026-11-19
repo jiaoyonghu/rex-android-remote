@@ -17,7 +17,7 @@ public final class CommandAudioSegmenter {
             if(!speaking){
                 short[] frame=java.util.Arrays.copyOf(pcm,count);
                 leading.addLast(frame);
-                while(leading.size()>5)leading.removeFirst();
+                while(leading.size()>7)leading.removeFirst();
                 return null;
             }
             inSpeech=true;

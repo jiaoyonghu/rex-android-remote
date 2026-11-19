@@ -9,26 +9,46 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
-/**
- * Locally learned speech-command acoustic templates. Records NO RAW AUDIO.
- * At least three isolated, self-labelled examples are required per phrase.
- * Conservative rejection: nearest template and supporting 2nd template must
- * agree, and an unrelated trained phrase must not have a close acoustic score.
- * These scores are uncalibrated and NEVER authorize a motor command.
- */
+/** Existing v0.7 takes remain available; every finished utterance is evaluated. */
 public final class CommandTemplateStore {
     public static final int MIN_TAKES=3,MAX_TAKES=5;
-    private static final String PREF="rex_phrase_templates_v7";
+    private static final String PREF="rex_phrase_templates_v7"; // no destructive migration
     private final SharedPreferences prefs;
+    private final Map<Integer,Trained> cache=new HashMap<>();
     public static final class Result {
-        public final int index;
-        public final float distance;
-        public final float competitor;
+        public final int index,candidateIndex,competitorIndex;
+        public final float distance,limit,competitor;
         public final String reason;
-        Result(int idx,float d,float other,String why){index=idx;distance=d;competitor=other;reason=why;}
+        Result(int accepted,int candidate,int other,float d,float threshold,float otherCost,String why){
+            index=accepted;candidateIndex=candidate;competitorIndex=other;
+            distance=d;limit=threshold;competitor=otherCost;reason=why;
+        }
         public boolean accepted(){return index>=0;}
+        public String diagnostic(){
+            if(candidateIndex<0)return reason;
+            String msg="模板「"+CommandPhrases.at(candidateIndex)+"」"
+                +String.format(java.util.Locale.ROOT," %.2f/%.2f",distance,limit);
+            if(competitorIndex>=0)
+                msg+=" · 其他动作「"+CommandPhrases.at(competitorIndex)+"」"
+                    +String.format(java.util.Locale.ROOT," %.2f",competitor);
+            return msg+" · "+reason;
+        }
+    }
+    private static final class Trained {
+        final List<float[][]> takes;
+        final float radius;
+        Trained(List<float[][]> takes,float radius){this.takes=takes;this.radius=radius;}
+    }
+    private static final class Score {
+        final int phrase;final float first,second,score,limit;
+        Score(int phrase,float first,float second,float limit){
+            this.phrase=phrase;this.first=first;this.second=second;
+            this.score=first*.65f+second*.35f;this.limit=limit;
+        }
     }
     public CommandTemplateStore(Context ctx){prefs=ctx.getSharedPreferences(PREF,Context.MODE_PRIVATE);}
     private String key(int phrase,int take){return "p"+phrase+"_"+take;}
@@ -42,75 +62,94 @@ public final class CommandTemplateStore {
         if(phrase<0||phrase>=CommandPhrases.count())return false;
         SharedPreferences.Editor e=prefs.edit();
         for(int i=0;i<MAX_TAKES;i++)e.remove(key(phrase,i));
-        return e.commit();
+        boolean done=e.commit(); if(done)cache.remove(phrase);
+        return done;
     }
-    /** One training take; never require ASR transcription to match the prompt. */
     public synchronized String add(int phrase,short[] pcm){
         if(phrase<0||phrase>=CommandPhrases.count())return "无效提示词";
         int n=count(phrase);
         if(n>=MAX_TAKES)return "本条已采满 5 次，可清除后重录";
         float[][] data=CommandAcoustics.features(pcm);
-        if(data==null)return "录音过短、过长或声音太小，请靠近手机再说一次";
+        if(data==null)return "音频过短、过长、噪声过大或太安静，请重新朗读";
         try{
-            // Reject only egregious mismatches; language/phrase is supplied by the
-            // user, so an acoustic model cannot truthfully verify it on its own.
             if(n>=2){
-                float nearest=Float.POSITIVE_INFINITY;
-                for(int i=0;i<n;i++)nearest=Math.min(nearest,
-                    CommandAcoustics.distance(data,decode(prefs.getString(key(phrase,i),""))));
-                if(nearest>1.7f)return "这次声音与前两次差异过大，请重读同一句";
+                Trained trained=load(phrase);
+                float closest=Float.POSITIVE_INFINITY;
+                float among=0;
+                for(int a=0;a<trained.takes.size();a++){
+                    closest=Math.min(closest,CommandAcoustics.distance(data,trained.takes.get(a)));
+                    for(int b=a+1;b<trained.takes.size();b++)
+                        among=Math.max(among,CommandAcoustics.distance(trained.takes.get(a),trained.takes.get(b)));
+                }
+                // Reject obvious mislabeled clips, not legitimate variations in distance.
+                float maxAllowed=Math.max(.72f,Math.min(1.45f,among*1.7f+.20f));
+                if(closest>maxAllowed)return "与本条已录样本差异过大（可能录错词或有噪声），请重录";
             }
-            String encoded=encode(data);
-            if(!prefs.edit().putString(key(phrase,n),encoded).commit())return "本地保存失败，请重试";
+            if(!prefs.edit().putString(key(phrase,n),encode(data)).commit())return "本地保存失败";
+            cache.remove(phrase);
             return null;
-        }catch(Exception e){return "声学特征写入失败，请重新采集";}
+        }catch(Exception ex){return "声学特征无法写入，请重录";}
+    }
+    private Trained load(int phrase){
+        Trained existing=cache.get(phrase);if(existing!=null)return existing;
+        List<float[][]> takes=new ArrayList<>();
+        for(int i=0;i<MAX_TAKES;i++){
+            float[][] clip=decode(prefs.getString(key(phrase,i),""));
+            if(clip!=null)takes.add(clip);
+        }
+        float largestNearest=0;
+        for(int a=0;a<takes.size();a++){
+            float nearest=Float.POSITIVE_INFINITY;
+            for(int b=0;b<takes.size();b++)if(a!=b)
+                nearest=Math.min(nearest,CommandAcoustics.distance(takes.get(a),takes.get(b)));
+            if(Float.isFinite(nearest))largestNearest=Math.max(largestNearest,nearest);
+        }
+        // Individual leave-one-out radius, bounded against mislabeled enrolments.
+        float radius=Math.max(.22f,Math.min(.82f,largestNearest*1.22f+.16f));
+        Trained trained=new Trained(takes,radius);cache.put(phrase,trained);return trained;
     }
     public synchronized Result match(short[] pcm){
         float[][] candidate=CommandAcoustics.features(pcm);
-        if(candidate==null)return new Result(-1,Float.POSITIVE_INFINITY,Float.POSITIVE_INFINITY,"无有效语音片段");
+        if(candidate==null)return new Result(-1,-1,-1,Float.POSITIVE_INFINITY,0,
+            Float.POSITIVE_INFINITY,"语音片段不够清晰，未做指令猜测");
         return matchFeatures(candidate);
     }
     public synchronized Result matchFeatures(float[][] candidate){
-        int bestPhrase=-1;
-        float best=Float.POSITIVE_INFINITY,backing=Float.POSITIVE_INFINITY;
-        float nearestOther=Float.POSITIVE_INFINITY;
-        float winnerAllowed=.25f;
-        for(int i=0;i<CommandPhrases.count();i++){
-            if(count(i)<MIN_TAKES)continue;
+        if(candidate==null)return new Result(-1,-1,-1,Float.POSITIVE_INFINITY,0,
+            Float.POSITIVE_INFINITY,"缺少音频特征");
+        List<Score> ranked=new ArrayList<>();
+        for(int p=0;p<CommandPhrases.count();p++){
+            if(count(p)<MIN_TAKES)continue;
+            Trained t=load(p);
+            if(t.takes.size()<MIN_TAKES)continue;
             float first=Float.POSITIVE_INFINITY,second=Float.POSITIVE_INFINITY;
-            List<float[][]> samples=new ArrayList<>();
-            for(int j=0;j<MAX_TAKES;j++){
-                String raw=prefs.getString(key(i,j),"");if(raw==null||raw.isEmpty())continue;
-                float[][] saved=decode(raw);if(saved==null)continue;
-                samples.add(saved);
+            for(float[][] saved:t.takes){
                 float d=CommandAcoustics.distance(candidate,saved);
                 if(d<first){second=first;first=d;}
                 else if(d<second)second=d;
             }
-            if(samples.size()<MIN_TAKES)continue;
-            // Each phrase learns a small acceptance radius from its own takes.
-            // Quiet/consistent recordings get a tighter bound; variable takes
-            // cannot widen it without limit.
-            float spread=0;
-            for(int a=0;a<samples.size();a++)for(int b=a+1;b<samples.size();b++){
-                float d=CommandAcoustics.distance(samples.get(a),samples.get(b));
-                if(Float.isFinite(d))spread=Math.max(spread,d);
-            }
-            float allowed=Math.max(.24f,Math.min(.78f,spread*1.22f+.14f));
-            float support=Math.max(first,second);
-            if(support<best){
-                nearestOther=Math.min(nearestOther,best);
-                best=support;backing=first;bestPhrase=i;winnerAllowed=allowed;
-            }else nearestOther=Math.min(nearestOther,support);
+            if(Float.isFinite(second))ranked.add(new Score(p,first,second,t.radius));
         }
-        if(bestPhrase<0)return new Result(-1,best,nearestOther,"尚无完成至少三次训练的口令");
-        // Empirically conservative initial cutoff, to be calibrated with a user's
-        // positive/negative recordings. Never silently lower it just to force a hit.
-        if(best>winnerAllowed || backing>winnerAllowed*.90f)
-            return new Result(-1,best,nearestOther,"声学相似度不足，使用原离线识别结果");
-        if(Float.isFinite(nearestOther) && nearestOther-best<.20f)
-            return new Result(-1,best,nearestOther,"与另一条口令太相似，拒绝猜测");
-        return new Result(bestPhrase,best,nearestOther,"个性化模板高置信命中（仅界面预览）");
+        if(ranked.isEmpty())return new Result(-1,-1,-1,Float.POSITIVE_INFINITY,0,
+            Float.POSITIVE_INFINITY,"没有至少完成三次采集的有效口令");
+        ranked.sort((a,b)->Float.compare(a.score,b.score));
+        Score winner=ranked.get(0),other=null;
+        for(Score score:ranked){
+            if(CommandPhrases.command(score.phrase)!=CommandPhrases.command(winner.phrase)){
+                other=score;break;
+            }
+        }
+        int otherIndex=other==null?-1:other.phrase;
+        float otherScore=other==null?Float.POSITIVE_INFINITY:other.score;
+        if(winner.first>winner.limit*.96f || winner.second>winner.limit*1.24f ||
+            winner.score>winner.limit)
+            return new Result(-1,winner.phrase,otherIndex,winner.score,winner.limit,otherScore,
+                "个人阈值未通过，不能自动认作该口令");
+        if(other!=null && otherScore-winner.score<Math.max(.10f,winner.score*.20f))
+            return new Result(-1,winner.phrase,otherIndex,winner.score,winner.limit,otherScore,
+                "两个不同动作的口令过于相似，拒绝猜测");
+        return new Result(winner.phrase,winner.phrase,otherIndex,winner.score,winner.limit,otherScore,
+            "个人样本辅助命中");
     }
     private static String encode(float[][] data)throws IOException{
         if(data.length>350)throw new IOException("too many frames");

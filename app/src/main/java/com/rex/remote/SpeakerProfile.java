@@ -6,64 +6,91 @@ import org.json.JSONArray;
 import java.util.ArrayList;
 import java.util.List;
 
-/**
- * Stores ONLY speaker embeddings in the application's private preferences.
- * No raw microphone recordings are written. Enrollment and verification are
- * uncalibrated prototypes: replay and synthesized speech can spoof them.
- */
+/** Experimental x-vector similarity display, not identity proof or IR authorization. */
 public final class SpeakerProfile {
-    private static final String PREF="rex_owner_voice_private_v1";
+    private static final String PREF="rex_owner_voice_private_v1"; // compatible with v0.7
     private static final String VECTOR="owner_embedding";
-    public static final int MIN_SAMPLES=3;
-    public static final int TARGET_SAMPLES=5;
-    // Prototype-only heuristic, deliberately NEVER used as motor authorization.
-    private static final float TEST_THRESHOLD=.72f;
+    private static final String THRESHOLD="owner_personal_threshold_v8";
+    public static final int MIN_SAMPLES=3,TARGET_SAMPLES=5;
+    private static final float OLD_THRESHOLD=.72f;
     private final SharedPreferences prefs;
     private final List<float[]> samples=new ArrayList<>();
     private boolean enrolling;
-
+    public static final class Match {
+        public final float similarity,threshold;
+        public final boolean verified,calibrated;
+        Match(float s,float t,boolean c){similarity=s;threshold=t;verified=s>=t;calibrated=c;}
+    }
     public SpeakerProfile(Context ctx){prefs=ctx.getSharedPreferences(PREF,Context.MODE_PRIVATE);}
     public synchronized boolean hasProfile(){return load()!=null;}
     public synchronized void begin(){samples.clear();enrolling=true;}
     public synchronized boolean isEnrolling(){return enrolling;}
     public synchronized int sampleCount(){return samples.size();}
-    public synchronized boolean add(float[] v) {
-        if(!enrolling || samples.size()>=8) return false;
+    public synchronized boolean add(float[] v){
+        if(!enrolling || samples.size()>=TARGET_SAMPLES)return false;
         float[] u=SpeakerMath.unit(v);
-        if(u==null) return false;
-        if(!samples.isEmpty() && u.length!=samples.get(0).length) return false;
-        samples.add(u); return true;
-    }
-    public synchronized boolean finish() {
-        if(!enrolling || samples.size()<MIN_SAMPLES) return false;
-        float[] avg=SpeakerMath.centroid(samples);
-        if(avg==null)return false;
-        JSONArray js=new JSONArray();
-        try {
-            for (float x : avg) js.put((double) x);
-        } catch (org.json.JSONException e) {
-            return false;
+        if(u==null)return false;
+        if(!samples.isEmpty()){
+            if(u.length!=samples.get(0).length)return false;
+            // Verify internal consistency before accepting the next take.
+            // Loose enough to tolerate different prompted sentences.
+            float[] center=unitMean(samples);
+            if(center==null || SpeakerMath.cosine(u,center)<.45f)return false;
         }
-        boolean saved=prefs.edit().putString(VECTOR,js.toString()).commit();
+        samples.add(u);return true;
+    }
+    private static float[] unitMean(List<float[]> vectors) {
+        if(vectors.isEmpty())return null;
+        float[] sum=new float[vectors.get(0).length];
+        for(float[] u:vectors)for(int j=0;j<sum.length;j++)sum[j]+=u[j];
+        return SpeakerMath.unit(sum);
+    }
+    public synchronized boolean finish(){
+        if(!enrolling || samples.size()<MIN_SAMPLES)return false;
+        float[] avg=unitMean(samples);
+        if(avg==null)return false;
+        float lowest=1f;
+        for(int i=0;i<samples.size();i++){
+            List<float[]> others=new ArrayList<>(samples);
+            others.remove(i);
+            float[] center=unitMean(others);
+            if(center==null)return false;
+            lowest=Math.min(lowest,SpeakerMath.cosine(samples.get(i),center));
+        }
+        if(lowest<.50f)return false; // suspect mixed speakers / badly corrupted recording
+        // Personalized lower-bound on genuine examples; no population impostor set.
+        float threshold=Math.max(.54f,Math.min(.83f,lowest*.80f-.045f));
+        JSONArray js=new JSONArray();
+        try{for(float x:avg)js.put((double)x);}
+        catch(org.json.JSONException ex){return false;}
+        boolean saved=prefs.edit().putString(VECTOR,js.toString())
+            .putString(THRESHOLD,Float.toString(threshold)).commit();
         if(saved){samples.clear();enrolling=false;}
         return saved;
     }
-    public synchronized void clear() {
-        samples.clear(); enrolling=false; prefs.edit().remove(VECTOR).commit();
+    public synchronized void clear(){
+        samples.clear();enrolling=false;
+        prefs.edit().remove(VECTOR).remove(THRESHOLD).commit();
     }
-    public synchronized void abandon() {samples.clear();enrolling=false;}
-    public synchronized float score(float[] candidate) {
-        float[] enrolled=load();
-        if(enrolled==null)return -1;
-        return SpeakerMath.cosine(enrolled,candidate);
-    }
-    public synchronized boolean matches(float[] candidate) {
-        return score(candidate)>=TEST_THRESHOLD;
-    }
-    private float[] load() {
-        String text=prefs.getString(VECTOR,"");
-        if(text==null || text.isEmpty()) return null;
+    public synchronized void abandon(){samples.clear();enrolling=false;}
+    public synchronized Match verify(float[] candidate){
+        float[] registered=load();
+        float similarity=registered==null?-1f:SpeakerMath.cosine(registered,candidate);
+        String t=prefs.getString(THRESHOLD,"");
+        boolean calibrated=false;
+        float threshold=OLD_THRESHOLD;
         try {
+            float f=Float.parseFloat(t);
+            if(Float.isFinite(f)&&f>=.54f&&f<=.83f){threshold=f;calibrated=true;}
+        }catch(Exception ignored){}
+        return new Match(similarity,threshold,calibrated);
+    }
+    public synchronized float score(float[] candidate){return verify(candidate).similarity;}
+    public synchronized boolean matches(float[] candidate){return verify(candidate).verified;}
+    private float[] load(){
+        String text=prefs.getString(VECTOR,"");
+        if(text==null || text.isEmpty())return null;
+        try{
             JSONArray a=new JSONArray(text);
             if(a.length()<64 || a.length()>512)return null;
             float[] v=new float[a.length()];
