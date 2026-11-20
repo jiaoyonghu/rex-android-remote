@@ -67,6 +67,9 @@ public final class VoiceService extends Service {
     private static final String CHANNEL="rex_offline_voice_v7"; // preserve notification channel
     private static final String TAG="RExOfflineVoice";
     private static final int SAMPLE_RATE=16000;
+    // Set false to use only the previously working sherpa KWS/VAD pipeline.
+    // Diagnostic switch for native ONNX crashes; it does not erase trained samples.
+    private static final boolean ENABLE_PERSONAL_NEURAL=true;
     private static final String SHERPA_MODEL_ZIP="rex-sherpa-kws-zh-en-v1.zip";
     private static final String SHERPA_MODEL_FOLDER="rex-sherpa-kws-zh-en-v1";
     private final ArrayBlockingQueue<AudioFrame> audioFrames=new ArrayBlockingQueue<>(16);
@@ -259,8 +262,9 @@ public final class VoiceService extends Service {
         // supervised recording button supplies the label; use actual audio
         // quality and within-phrase consistency checks instead. It is NOT
         // subsequently allowed to trigger an action without KWS evidence.
-        float[] vector=features.embed(clip.pcm);
-        String failure=neural.add(clip.phrase,vector);
+        float[] vector=features==null?null:features.embed(clip.pcm);
+        String failure=features==null?
+            "个人神经模型不可用；基础关键词监听继续运行":neural.add(clip.phrase,vector);
         if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
         else {
             int n=neural.count(clip.phrase);trainingCount=n;
@@ -348,7 +352,7 @@ public final class VoiceService extends Service {
         for(int i=0;i<CommandPhrases.count();i++){
             if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES){trained=true;break;}
         }
-        PersonalNeuralStore.Result match=trained?
+        PersonalNeuralStore.Result match=trained && features!=null?
             neural.evaluate(features.embed(clip.pcm)):null;
         RexCommand command=kws.command;
         boolean wake=kws.wake;
@@ -411,8 +415,11 @@ public final class VoiceService extends Service {
             File kwsDir=unpackSherpaModel();
             if(!running)return;
             updateStatus("启动 Zipformer KWS + Silero VAD + openWakeWord 个人神经模型…");
-            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir);
-                OpenWakeWordFeatures personalFeatures=new OpenWakeWordFeatures(this)){
+            // The personal ONNX frontend is optional and loaded only on first use.
+            // A missing/broken personal model must not terminate the primary KWS.
+            OpenWakeWordFeatures personalFeatures=null;
+            boolean personalUnavailable=false;
+            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir)){
                 int minimum=AudioRecord.getMinBufferSize(SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
                 if(minimum<=0)throw new IllegalStateException("不支持16kHz麦克风");
@@ -448,7 +455,32 @@ public final class VoiceService extends Service {
                         }
                         for(SherpaVoiceEngine.Clip clip:engine.accept(packet.samples,packet.samples.length)){
                             if(gen!=captureGeneration)break;
-                            recognizeSherpaClip(clip,gen,engine,personalFeatures);
+                            boolean needPersonal=ENABLE_PERSONAL_NEURAL && trainingMode;
+                            if(ENABLE_PERSONAL_NEURAL && !needPersonal && !profile.isEnrolling()){
+                                for(int i=0;i<CommandPhrases.count();i++){
+                                    if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES){
+                                        needPersonal=true;break;
+                                    }
+                                }
+                            }
+                            if(needPersonal && personalFeatures==null && !personalUnavailable){
+                                try{
+                                    personalFeatures=new OpenWakeWordFeatures(this);
+                                    Log.i(TAG,"Personal ONNX frontend loaded on demand");
+                                }catch(Exception | LinkageError ex){
+                                    personalUnavailable=true;
+                                    Log.e(TAG,"Optional personal ONNX frontend unavailable; KWS continues",ex);
+                                    status="个人模型暂不可用；基础关键词识别继续运行";
+                                    publish(null,null,null,false,0f);
+                                }
+                            }
+                            try{
+                                recognizeSherpaClip(clip,gen,engine,personalFeatures);
+                            }catch(RuntimeException ex){
+                                Log.e(TAG,"One voice clip failed; continuous KWS kept alive",ex);
+                                status="单条语音处理出错，已跳过并继续监听";
+                                publish(null,null,null,false,0f);
+                            }
                         }
                     }
                 }finally{
@@ -456,6 +488,9 @@ public final class VoiceService extends Service {
                     if(ns!=null)ns.release();if(agc!=null)agc.release();
                     mic.release();recording=null;
                 }
+            }finally{
+                if(personalFeatures!=null)try{personalFeatures.close();}
+                catch(Exception ex){Log.w(TAG,"Optional neural feature cleanup failed",ex);}
             }
         }catch(Exception ex){
             if(running){
