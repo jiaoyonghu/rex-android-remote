@@ -21,6 +21,7 @@ dependencies {
     // Pinned official sherpa-onnx JVM API; GitHub Actions prepares this .jar
     // and its matching arm64 JNI binaries before Gradle runs.
     implementation files('libs/sherpa-onnx-jvm-2.0.2.jar')
-    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.23.2'
+    // Separate LiteRT Java frontend avoids native ONNX Runtime conflict with sherpa.
+    implementation 'com.google.ai.edge.litert:litert:1.4.2'
 }
 

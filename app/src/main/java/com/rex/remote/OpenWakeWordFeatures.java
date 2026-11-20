@@ -1,90 +1,127 @@
 package com.rex.remote;
 
-import ai.onnxruntime.OnnxTensor;
-import ai.onnxruntime.OrtEnvironment;
-import ai.onnxruntime.OrtException;
-import ai.onnxruntime.OrtSession;
+import android.content.Context;
+import android.util.Log;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
-import java.nio.FloatBuffer;
-import java.util.Collections;
-import java.util.Map;
-import android.content.Context;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import org.tensorflow.lite.Interpreter;
 
 /**
- * openWakeWord v0.5.1 frozen MEL + Google Speech Embedding frontend.
- * This is NOT the official openWakeWord DNN head and NOT speaker verification.
- * Each recorded command becomes a 16 x 96 neural sequence; the small personalized
- * classifier is fitted locally from supervised takes and other phrases as negatives.
- * Only the existing single decoder worker calls this class; never capture thread.
+ * Frozen openWakeWord v0.5.1 TFLite MEL + Google Speech Embedding frontend.
+ * This avoids loading a second incompatible ONNX Runtime JNI into sherpa's app.
+ * Not a speaker-verification model and not an end-to-end trained wakeword head.
+ * Invoked on the existing single audio decode thread only.
  */
 public final class OpenWakeWordFeatures implements Closeable {
-    public static final int DIM=16*96;
-    private static final int MEL_BINS=32, MEL_WINDOW=76, EMBEDDINGS=16;
-    private static final int RATE=16000, CONTEXT_SAMPLES=48000;
-    private final OrtEnvironment env;
-    private final OrtSession mel, speech;
+    public static final int DIM = 16 * 96;
+    private static final int RATE = 16000;
+    private static final int CONTEXT = 48000;
+    private static final int MEL_BINS = 32;
+    private static final int MEL_WINDOW = 76;
+    private static final int STEPS = 16;
+    private final Interpreter mel;
+    private final Interpreter speech;
 
-    public OpenWakeWordFeatures(Context ctx) throws IOException, OrtException {
-        env=OrtEnvironment.getEnvironment();
-        OrtSession.SessionOptions opts=new OrtSession.SessionOptions();
+    public OpenWakeWordFeatures(Context context) throws IOException {
+        Interpreter.Options options = new Interpreter.Options();
+        options.setNumThreads(1);
+        Interpreter m = null, s = null;
         try {
-            opts.setIntraOpNumThreads(1);opts.setInterOpNumThreads(1);
-            byte[] melBytes=read(ctx,"openwakeword/melspectrogram.onnx");
-            byte[] embBytes=read(ctx,"openwakeword/embedding_model.onnx");
-            mel=env.createSession(melBytes,opts);
-            speech=env.createSession(embBytes,opts);
-        } finally { opts.close(); }
-    }
-    private static byte[] read(Context ctx,String path) throws IOException{
-        try(java.io.InputStream s=ctx.getAssets().open(path)){
-            java.io.ByteArrayOutputStream out=new java.io.ByteArrayOutputStream();
-            byte[] buf=new byte[16384];int n;
-            while((n=s.read(buf))!=-1){
-                if(out.size()+n>10_000_000)throw new IOException("模型尺寸异常: "+path);
-                out.write(buf,0,n);
+            m = new Interpreter(read(context, "openwakeword/melspectrogram.tflite"), options);
+            s = new Interpreter(read(context, "openwakeword/embedding_model.tflite"), options);
+            m.resizeInput(0, new int[]{1, CONTEXT}, true);
+            m.allocateTensors();
+            // The official openWakeWord embedding model supports batched inputs.
+            s.resizeInput(0, new int[]{STEPS, MEL_WINDOW, MEL_BINS, 1}, true);
+            s.allocateTensors();
+            if (m.getOutputTensor(0).numBytes() <= 0 ||
+                s.getOutputTensor(0).numElements() < DIM) {
+                throw new IllegalStateException("Unexpected openWakeWord TFLite model output shape");
             }
-            return out.toByteArray();
+            mel = m;
+            speech = s;
+        } catch (RuntimeException | LinkageError ex) {
+            if (s != null) s.close();
+            if (m != null) m.close();
+            throw new IOException("openWakeWord TFLite initialization failed: " + ex, ex);
         }
     }
+
+    private static ByteBuffer read(Context context, String asset) throws IOException {
+        try (java.io.InputStream input = context.getAssets().open(asset)) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            byte[] chunk = new byte[16384];
+            int n;
+            while ((n = input.read(chunk)) != -1) {
+                if (bytes.size() + n > 10_000_000) throw new IOException("Model too large: " + asset);
+                bytes.write(chunk, 0, n);
+            }
+            byte[] raw = bytes.toByteArray();
+            if (raw.length < 8 || raw[4] != 'T' || raw[5] != 'F' || raw[6] != 'L' || raw[7] != '3') {
+                throw new IOException("Invalid TFLite asset: " + asset);
+            }
+            ByteBuffer direct = ByteBuffer.allocateDirect(raw.length).order(ByteOrder.nativeOrder());
+            direct.put(raw);
+            direct.rewind();
+            return direct;
+        }
+    }
+
+    private static ByteBuffer floats(int count) {
+        return ByteBuffer.allocateDirect(count * 4).order(ByteOrder.nativeOrder());
+    }
+
     public float[] embed(short[] pcm) {
-        if(pcm==null||pcm.length<3200||pcm.length>RATE*5)return null;
-        // Align the utterance centrally in a stable ~3 s context. Avoid having
-        // 1-syllable templates entirely overwhelmed by trailing silence.
-        float[] audio=new float[CONTEXT_SAMPLES];
-        int use=Math.min(pcm.length,CONTEXT_SAMPLES-3200);
-        int from=Math.max(0,pcm.length-use);
-        int start=(CONTEXT_SAMPLES-use)/2;
-        for(int i=0;i<use;i++)audio[start+i]=pcm[from+i]; // model uses unnormalised PCM16
-        try(OnnxTensor input=OnnxTensor.createTensor(env,FloatBuffer.wrap(audio),new long[]{1,CONTEXT_SAMPLES});
-            OrtSession.Result output=mel.run(Collections.singletonMap("input",input))) {
-            OnnxTensor spectral=(OnnxTensor)output.get(0);
-            long[] shape=spectral.getInfo().getShape();
-            if(shape.length!=4||shape[3]!=MEL_BINS||shape[2]<MEL_WINDOW)return null;
-            int count=(int)shape[2];
-            FloatBuffer buf=spectral.getFloatBuffer();
-            float[] full=new float[count*MEL_BINS];
-            for(int i=0;i<full.length;i++)full[i]=buf.get(i)/10f+2f;
-            float[] packed=new float[EMBEDDINGS*MEL_WINDOW*MEL_BINS];
-            int available=count-MEL_WINDOW;
-            for(int step=0;step<EMBEDDINGS;step++){
-                int fromFrame=Math.round(step*(available/(float)(EMBEDDINGS-1)));
-                System.arraycopy(full,fromFrame*MEL_BINS,packed,step*MEL_WINDOW*MEL_BINS,MEL_WINDOW*MEL_BINS);
+        if (pcm == null || pcm.length < 3200 || pcm.length > RATE * 5) return null;
+        try {
+            ByteBuffer audio = floats(CONTEXT);
+            int used = Math.min(pcm.length, CONTEXT - 3200);
+            int start = (CONTEXT - used) / 2;
+            int from = Math.max(0, pcm.length - used);
+            for (int i = 0; i < CONTEXT; i++) {
+                float sample = (i >= start && i < start + used) ? pcm[from + i - start] : 0f;
+                audio.putFloat(sample);
             }
-            try(OnnxTensor featureInput=OnnxTensor.createTensor(env,FloatBuffer.wrap(packed),
-                    new long[]{EMBEDDINGS,MEL_WINDOW,MEL_BINS,1});
-                OrtSession.Result result=speech.run(Collections.singletonMap("input_1",featureInput))){
-                OnnxTensor vectors=(OnnxTensor)result.get(0);
-                FloatBuffer v=vectors.getFloatBuffer();
-                if(v.remaining()<DIM)return null;
-                float[] features=new float[DIM];
-                for(int i=0;i<features.length;i++)features[i]=v.get(i);
-                return PersonalNeuralStore.unit(features);
+            audio.rewind();
+            ByteBuffer spectrum = ByteBuffer.allocateDirect(mel.getOutputTensor(0).numBytes())
+                    .order(ByteOrder.nativeOrder());
+            mel.run(audio, spectrum);
+            spectrum.rewind();
+            int floats = spectrum.remaining() / 4;
+            if (floats % MEL_BINS != 0) return null;
+            int frames = floats / MEL_BINS;
+            if (frames < MEL_WINDOW) return null;
+            float[] flat = new float[floats];
+            for (int i = 0; i < floats; i++) flat[i] = spectrum.getFloat() / 10f + 2f;
+
+            ByteBuffer patches = floats(STEPS * MEL_WINDOW * MEL_BINS);
+            int maxStart = frames - MEL_WINDOW;
+            for (int step = 0; step < STEPS; step++) {
+                int offset = Math.round(step * (maxStart / (float)(STEPS - 1)));
+                for (int i = 0; i < MEL_WINDOW * MEL_BINS; i++) {
+                    patches.putFloat(flat[offset * MEL_BINS + i]);
+                }
             }
-        }catch(OrtException|RuntimeException ex){
-            android.util.Log.e("RExPersonalNeural","openWakeWord feature inference failed",ex);
+            patches.rewind();
+            ByteBuffer embeddings = ByteBuffer.allocateDirect(speech.getOutputTensor(0).numBytes())
+                    .order(ByteOrder.nativeOrder());
+            speech.run(patches, embeddings);
+            embeddings.rewind();
+            if (embeddings.remaining() / 4 < DIM) return null;
+            float[] vector = new float[DIM];
+            for (int i = 0; i < DIM; i++) vector[i] = embeddings.getFloat();
+            return PersonalNeuralStore.unit(vector);
+        } catch (RuntimeException | LinkageError ex) {
+            Log.e("RExPersonalNeural", "TFLite personal frontend inference failed", ex);
             return null;
         }
     }
-    @Override public void close(){try{speech.close();}catch(Exception ignored){}try{mel.close();}catch(Exception ignored){}}
+
+    @Override public void close() {
+        try { speech.close(); } catch (RuntimeException ignored) { }
+        try { mel.close(); } catch (RuntimeException ignored) { }
+    }
 }
