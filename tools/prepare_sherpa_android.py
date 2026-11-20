@@ -48,11 +48,35 @@ def words_from_source():
     return labels
 
 
+def split_chinese_syllable(syllable, valid, label, han):
+    """Convert one CONTEXTUAL pinyin syllable to model initial + toned final.
+
+    pypinyin Style.FINALS_TONE expands 'shui4' into 'ueì' on some versions,
+    while this Sherpa KWS model expects 'sh uì'.  Splitting the actual
+    toned full syllable produces model-compatible contracted finals.
+    """
+    import unicodedata
+    syllable=unicodedata.normalize('NFC', syllable.lower())
+    initials=('zh','ch','sh','b','p','m','f','d','t','n','l','g','k',
+              'h','j','q','x','r','z','c','s','y','w')
+    for initial in initials:
+        if syllable.startswith(initial):
+            final=syllable[len(initial):]
+            if initial in valid and final in valid:
+                return [initial, final]
+    if syllable in valid:
+        return [syllable]  # e.g., ài, ér: zero initial
+    raise RuntimeError(
+        f'Keyword {label!r}: cannot encode character {han!r} '
+        f'(pinyin={syllable!r}) using this KWS model tokens.txt')
+
+
 def make_keywords(tokens, lexicon):
-    # Official bilingual KWS phoneme model: Chinese pinyin initials + toned
-    # finals, English ARPABET phones, with a strict @spoken-keyword label.
+    # Sherpa bilingual KWS uses Mandarin initial + toned final tokens and
+    # English ARPABET phones.  Every emitted token must exist in tokens.txt.
     from pypinyin import pinyin, Style
-    valid={line.split()[0] for line in tokens.decode('utf-8-sig').splitlines() if line.strip()}
+    valid={line.split()[0] for line in tokens.decode('utf-8-sig').splitlines()
+           if line.strip()}
     phones={}
     for line in lexicon.decode('utf-8',errors='replace').splitlines():
         parts=line.split()
@@ -65,7 +89,9 @@ def make_keywords(tokens, lexicon):
     out=[]
     for label in words_from_source():
         cleaned=re.sub(r'[，。！,!?？]', '', label)
-        chunks=re.findall(r'[A-Za-z]+|[\u4e00-\u9fff]',cleaned)
+        # IMPORTANT: retain entire Chinese phrases for polyphonic characters.
+        # pinyin('睡觉') -> shuì jiào, but pinyin('觉') alone -> jué.
+        chunks=re.findall(r'[A-Za-z]+|[\u4e00-\u9fff]+',cleaned)
         result=[]
         for chunk in chunks:
             if re.fullmatch('[A-Za-z]+',chunk):
@@ -73,13 +99,19 @@ def make_keywords(tokens, lexicon):
                     raise RuntimeError('Missing English pronunciation: '+chunk)
                 result.extend(phones[chunk.upper()])
             else:
-                initial=pinyin(chunk,style=Style.INITIALS,strict=True)[0][0]
-                final=pinyin(chunk,style=Style.FINALS_TONE,strict=True)[0][0]
-                if initial: result.append(initial)
-                if final: result.append(final)
+                syllables=pinyin(chunk,style=Style.TONE,heteronym=False)
+                if len(syllables)!=len(chunk):
+                    raise RuntimeError(f'Invalid Chinese word alignment: {chunk!r}')
+                for han, syllable_list in zip(chunk,syllables):
+                    if not syllable_list:
+                        raise RuntimeError(f'No pinyin for {han!r} in {label!r}')
+                    result.extend(split_chinese_syllable(
+                        syllable_list[0],valid,label,han))
         absent=[p for p in result if p not in valid]
         if absent: raise RuntimeError(f'Keyword {label!r} has unsupported phones: {absent}')
         if not result: raise RuntimeError('Empty keyword: '+label)
+        if label=='睡觉' and result!=['sh','uì','j','iào']:
+            raise RuntimeError('Contextual pronunciation for 睡觉 is incorrect: '+str(result))
         out.append(' '.join(result)+' @'+label.replace(' ','_'))
     print('Prepared',len(out),'distinct exact command phrases, all tokens verified', flush=True)
     return ('\n'.join(out)+'\n').encode('utf-8')
