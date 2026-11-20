@@ -32,7 +32,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * REx v0.9: fail-closed bilingual ASR + grammar + personal templates,
+ * REx v1.0: sherpa-onnx streaming KWS + Silero VAD + personal templates,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
@@ -72,6 +72,10 @@ public final class VoiceService extends Service {
     private static final String CHANNEL="rex_offline_voice_v7"; // keep notification channel
     private static final String TAG="RExOfflineVoice";
     private static final int SAMPLE_RATE=16000;
+    private static final String SHERPA_MODEL_ZIP="rex-sherpa-kws-zh-en-v1.zip";
+    private static final String SHERPA_MODEL_FOLDER="rex-sherpa-kws-zh-en-v1";
+    private final ArrayBlockingQueue<AudioFrame> audioFrames=new ArrayBlockingQueue<>(16);
+    private volatile boolean droppedAudio;
     private static final String ZH_MODEL_ZIP="vosk-model-small-cn-0.22.zip";
     private static final String ZH_MODEL_FOLDER="vosk-model-small-cn-0.22";
     private static final String EN_MODEL_ZIP="vosk-model-small-en-us-0.15.zip";
@@ -123,16 +127,13 @@ public final class VoiceService extends Service {
             trainingPhrase=Math.max(0,Math.min(CommandPhrases.count()-1,requestedPhrase));
             trainingCount=templates.count(trainingPhrase);
             trainingInfo="『"+CommandPhrases.at(trainingPhrase)+"』已录 "
-                +trainingCount+" / 5 次 · 仅辅助交叉确认";
+                +trainingCount+" / 5 次 · 可重新采集，满5次自动替换最旧样本";
             status="指令个性化训练 · 录音仅保留声学特征，不存原始音频";
             publishTraining("TRAIN_SELECTED");
         }
         if(ACTION_TRAIN_CAPTURE.equals(action)){
             if(!trainingMode || requestedPhrase!=trainingPhrase){
                 trainingInfo="提示词已改变，请重新选择当前指令";
-                publishTraining("TRAIN_FAIL");
-            }else if(templates.count(trainingPhrase)>=CommandTemplateStore.MAX_TAKES){
-                trainingInfo="本条已采集 5 次，请切换指令或清除后重录";
                 publishTraining("TRAIN_FAIL");
             }else{
                 trainingArmed=true;captureGeneration++;
@@ -231,19 +232,19 @@ public final class VoiceService extends Service {
             stopSelf();return START_NOT_STICKY;
         }
         NotificationManager nm=getSystemService(NotificationManager.class);
-        nm.createNotificationChannel(new NotificationChannel(CHANNEL,"REx 本地双语 + 声纹",NotificationManager.IMPORTANCE_LOW));
+        nm.createNotificationChannel(new NotificationChannel(CHANNEL,"REx 神经语音 + 声纹",NotificationManager.IMPORTANCE_LOW));
         PendingIntent open=PendingIntent.getActivity(this,0,
             new Intent(this,MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
         Notification notification=new Notification.Builder(this,CHANNEL)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("REx · 离线实时监听")
+            .setContentTitle("REx · 离线神经语音监听")
             .setContentText("持续监听直到手动停止 · 声纹试验版 · 不控制电机")
             .setContentIntent(open).setOngoing(true).build();
         try {startForeground(1001,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);}
         catch(Exception e){status="麦克风服务启动失败："+e.getClass().getSimpleName();
             publish(null,null,null,false,0f);stopSelf();return START_NOT_STICKY;}
-        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v9");worker.start();}
+        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-sherpa-voice-v10");worker.start();}
         publish(null,null,null,false,0f);
         return START_NOT_STICKY;
     }
@@ -257,36 +258,71 @@ public final class VoiceService extends Service {
             pcm=audio;this.phrase=phrase;this.generation=generation;
         }
     }
-    private void handleTrainingClip(CommandClip clip,String zh,String en,
-                                    String focusedZh,String focusedEn){
+    private void handleTrainingClip(CommandClip clip){
         if(!trainingMode || clip.phrase!=trainingPhrase ||
            clip.generation!=captureGeneration)return;
-        // The record button specifies a *label*, not a supervision signal.
-        // A noise or different spoken word must not silently become a template.
-        // Reject when either unrestricted model recognises a different known
-        // command, and require the target phrase to appear verbatim in ASR or
-        // the focused grammar (not a mere same-action synonym).
-        String expected=RexCommand.norm(CommandPhrases.at(clip.phrase));
-        boolean exact=expected.equals(RexCommand.norm(zh)) ||
-            expected.equals(RexCommand.norm(en)) ||
-            expected.equals(RexCommand.norm(focusedZh)) ||
-            expected.equals(RexCommand.norm(focusedEn));
-        if(!exact){
-            trainingInfo="未核对到『"+CommandPhrases.at(clip.phrase)+"』，没有保存此样本；请清楚朗读后重试";
-            publishTraining("TRAIN_FAIL");
-            return;
-        }
+        // Vosk v0.9 exact-transcript gating rejected the owner's accent. A
+        // supervised recording button supplies the label; use actual audio
+        // quality and within-phrase consistency checks instead. It is NOT
+        // subsequently allowed to trigger an action without KWS evidence.
         String failure=templates.add(clip.phrase,clip.pcm);
         if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
         else {
             int n=templates.count(clip.phrase);trainingCount=n;
-            trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』采集 " + n
-                +"/5"+(n>=3?" · 可辅助交叉确认（模板不会单独触发口令）":
-                " · 再采 "+(3-n)+" 次才生效");
+            trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』已采集 "+n+
+                "/5"+(n>=3?" · 已参与关键词交叉验证 · 可继续采集替换旧样本":
+                " · 还需 "+(3-n)+" 次");
             publishTraining("TRAIN_OK");
         }
     }
-
+    private File unpackSherpaModel() throws Exception {
+        File root=new File(getFilesDir(),"rex_offline_models");
+        File folder=new File(root,SHERPA_MODEL_FOLDER);
+        File marker=new File(folder,".rex_sherpa_ready_v1");
+        String[] files={"encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+            "decoder-epoch-13-avg-2-chunk-16-left-64.onnx",
+            "joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+            "tokens.txt","keywords.txt","silero_vad.onnx"};
+        boolean valid=marker.isFile();
+        for(String f:files)valid &= new File(folder,f).length()>100;
+        if(valid)return folder;
+        if(!root.exists() && !root.mkdirs())throw new IllegalStateException("无法创建模型目录");
+        updateStatus("首次启动 · 解压 Sherpa 神经识别模型…");
+        long expanded=0;int count=0;
+        String rootPath=root.getCanonicalPath()+File.separator;
+        try(InputStream in=getAssets().open(SHERPA_MODEL_ZIP);
+            ZipInputStream zip=new ZipInputStream(new BufferedInputStream(in))){
+            ZipEntry entry;byte[] buf=new byte[32768];
+            while((entry=zip.getNextEntry())!=null){
+                if(++count>20)throw new IllegalStateException("Sherpa 模型条目异常");
+                String name=entry.getName().replace('\\','/');
+                if(!name.startsWith(SHERPA_MODEL_FOLDER+"/") || name.contains("../") ||
+                    name.startsWith("/"))throw new IllegalStateException("模型路径非法");
+                File target=new File(root,name);
+                if(!target.getCanonicalPath().startsWith(rootPath))
+                    throw new IllegalStateException("模型路径越界");
+                if(entry.isDirectory()){
+                    if(!target.exists()&&!target.mkdirs())throw new IllegalStateException("模型目录创建失败");
+                }else{
+                    File parent=target.getParentFile();
+                    if(parent!=null&&!parent.exists()&&!parent.mkdirs())
+                        throw new IllegalStateException("模型目录创建失败");
+                    try(FileOutputStream out=new FileOutputStream(target)){
+                        int n;while((n=zip.read(buf))!=-1){
+                            expanded+=n;
+                            if(expanded>40L*1024*1024)throw new IllegalStateException("模型超出上限");
+                            out.write(buf,0,n);
+                        }
+                    }
+                }
+                zip.closeEntry();
+            }
+        }
+        for(String f:files)if(new File(folder,f).length()<100)
+            throw new IllegalStateException("缺少 Sherpa 模型："+f);
+        if(!marker.exists()&&!marker.createNewFile())throw new IllegalStateException("模型标记失败");
+        return folder;
+    }
     /** Copies one prepackaged Vosk ZIP into app-private storage on first use. */
     private File unpackBundledModel(String zipName, String folder, String language) throws Exception {
         File root = new File(getFilesDir(), "rex_offline_models");
@@ -392,36 +428,90 @@ public final class VoiceService extends Service {
         if(e!=null && (evidence==null || e.frames>evidence.frames))evidence=e;
         return new Decoded(words.toString().trim(),evidence);
     }
+    private static final class AudioFrame {
+        final short[] samples;final long generation;
+        AudioFrame(short[] samples,long generation){this.samples=samples;this.generation=generation;}
+    }
+    /** Model + Vosk speaker model are ONLY initialized for guided enrollment. */
+    private final class EnrollmentDecoder implements AutoCloseable {
+        final Model zhModel,enModel;
+        final SpeakerModel speaker;
+        final Recognizer zh,en;
+        EnrollmentDecoder()throws Exception{
+            File z=unpackBundledModel(ZH_MODEL_ZIP,ZH_MODEL_FOLDER,"中文");
+            File e=unpackBundledModel(EN_MODEL_ZIP,EN_MODEL_FOLDER,"英文");
+            File sp=unpackBundledModel(SPEAKER_ZIP,SPEAKER_FOLDER,"声纹");
+            zhModel=new Model(z.getAbsolutePath());enModel=new Model(e.getAbsolutePath());
+            speaker=new SpeakerModel(sp.getAbsolutePath());
+            zh=new Recognizer(zhModel,SAMPLE_RATE);en=new Recognizer(enModel,SAMPLE_RATE);
+            zh.setSpeakerModel(speaker);en.setSpeakerModel(speaker);
+        }
+        @Override public void close(){
+            en.close();zh.close();speaker.close();enModel.close();zhModel.close();
+        }
+    }
+    private void recognizeSherpaClip(SherpaVoiceEngine.Clip clip,long generation,
+                                      EnrollmentDecoder enrollment){
+        if(generation!=captureGeneration)return;
+        if(trainingMode){
+            if(trainingArmed && SystemClock.elapsedRealtime()<=trainingDeadline){
+                trainingArmed=false;
+                handleTrainingClip(new CommandClip(clip.pcm,trainingPhrase,generation));
+            }
+            return;
+        }
+        if(profile.isEnrolling()){
+            if(!enrollArmed || enrollment==null)return;
+            Decoded cn=decodeClip(enrollment.zh,clip.pcm);
+            Decoded en=decodeClip(enrollment.en,clip.pcm);
+            if(generation==captureGeneration)
+                consumeUtterance(cn.text,en.text,"","",cn.speaker,en.speaker,null);
+            return;
+        }
+        ownerStatus=profile.hasProfile()
+            ?"主人声纹已保存 · 当前 KWS 短口令不作声纹认证（仅预览）"
+            :"尚未录入声纹 · 仅预览";
+        CommandTemplateStore.Result personal=null;
+        // Templates never originate a keyword. A positive independent neural
+        // KWS candidate is required before any DTW matching.
+        if(!clip.keyword.isEmpty() && !clip.conflictingKeywords)
+            personal=templates.match(clip.pcm);
+        SherpaCommandPolicy.Decision decision=SherpaCommandPolicy.decide(
+            clip.keyword,awake,personal,clip.conflictingKeywords);
+        if(decision.command==null && !decision.wake && clip.keyword.isEmpty())return;
+        long now=SystemClock.elapsedRealtime();
+        String signature=decision.command+"|"+decision.wake+"|"+RexCommand.norm(clip.keyword);
+        if(signature.equals(lastFinalSignature)&&now-lastFinalMs<700)return;
+        lastFinalSignature=signature;lastFinalMs=now;
+        RexCommand command=decision.command;
+        if(decision.wake)awake=true;
+        if(command==null && decision.wake){
+            status="REx 已唤醒 · 神经关键词检测";
+        }else if(command==RexCommand.SLEEP){
+            awake=false;lastOwnerVerifiedMs=0;status="已进入睡眠待机";
+        }else if(command!=null){
+            status="识别「"+command.label+"」· "+decision.reason+" · 仅预览，不发运动红外";
+        }else status="口令未确认 · "+decision.reason;
+        publish("神经关键词: "+clip.keyword,null,command,decision.wake,0f);
+    }
     private void recognitionLoop(){
-        try {
-            File zhDir=unpackBundledModel(ZH_MODEL_ZIP,ZH_MODEL_FOLDER,"中文");
+        EnrollmentDecoder enrollDecoder=null;
+        try{
+            File kwsDir=unpackSherpaModel();
             if(!running)return;
-            File enDir=unpackBundledModel(EN_MODEL_ZIP,EN_MODEL_FOLDER,"英文");
-            if(!running)return;
-            File speakerDir=unpackBundledModel(SPEAKER_ZIP,SPEAKER_FOLDER,"声纹");
-            if(!running)return;
-            updateStatus("正在加载双语离线识别 + 固定词表 + 声纹模型…");
-            try(Model zhModel=new Model(zhDir.getAbsolutePath());
-                Model enModel=new Model(enDir.getAbsolutePath());
-                SpeakerModel speakerModel=new SpeakerModel(speakerDir.getAbsolutePath());
-                Recognizer zh=new Recognizer(zhModel,SAMPLE_RATE);
-                Recognizer en=new Recognizer(enModel,SAMPLE_RATE);
-                OptionalGrammar focusedZh=new OptionalGrammar(zhModel,VoskGrammar.chinese(),"中文");
-                OptionalGrammar focusedEn=new OptionalGrammar(enModel,VoskGrammar.english(),"英文")) {
-                zh.setSpeakerModel(speakerModel);
-                en.setSpeakerModel(speakerModel);
+            updateStatus("正在启动 Silero VAD + 中英双语 Zipformer 关键词模型…");
+            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir)){
                 int minimum=AudioRecord.getMinBufferSize(SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
-                if(minimum<=0)throw new IllegalStateException("不支持 16kHz 麦克风");
+                if(minimum<=0)throw new IllegalStateException("不支持16kHz麦克风");
                 AudioRecord mic=new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    SAMPLE_RATE,AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,Math.max(minimum*2,8192));
+                    SAMPLE_RATE,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,
+                    Math.max(minimum*2,8192));
                 recording=mic;
                 if(mic.getState()!=AudioRecord.STATE_INITIALIZED)
-                    throw new IllegalStateException("AudioRecord 初始化失败");
-                NoiseSuppressor ns=null;
-                AutomaticGainControl agc=null;
-                try {
+                    throw new IllegalStateException("AudioRecord 未能初始化");
+                NoiseSuppressor ns=null;AutomaticGainControl agc=null;
+                try{
                     try{if(NoiseSuppressor.isAvailable()){
                         ns=NoiseSuppressor.create(mic.getAudioSessionId());
                         if(ns!=null)ns.setEnabled(true);
@@ -431,122 +521,75 @@ public final class VoiceService extends Service {
                         if(agc!=null)agc.setEnabled(true);
                     }}catch(Exception ex){Log.w(TAG,"AGC unavailable",ex);}
                     mic.startRecording();
-                    updateStatus("离线监听中 · 双语模型+个人模板交叉确认 · 拒绝单路猜测 · 仅预览");
-                    Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic");
+                    updateStatus("流式离线监听 · 神经 VAD + 关键词检测 · 仅预览");
+                    Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic-v10");
                     capture.start();
+                    long previousGeneration=-1;
                     while(running){
-                        CommandClip clip=commandClips.poll(250,TimeUnit.MILLISECONDS);
-                        if(!running || clip==null)continue;
-                        if(clip.generation!=captureGeneration)continue;
-                        if(clip.phrase>=0){
-                            // No more arbitrary audio labelled as a successful
-                            // training take: first check the prompted phrase.
-                            Decoded trainCn=decodeClip(zh,clip.pcm);
-                            Decoded trainEn=decodeClip(en,clip.pcm);
-                            String trainGrZh=focusedZh.recognizer==null?"":
-                                decodeClip(focusedZh.recognizer,clip.pcm).text;
-                            String trainGrEn=focusedEn.recognizer==null?"":
-                                decodeClip(focusedEn.recognizer,clip.pcm).text;
-                            if(clip.generation!=captureGeneration)continue;
-                            handleTrainingClip(clip,trainCn.text,trainEn.text,
-                                trainGrZh,trainGrEn);
-                            continue;
+                        AudioFrame packet=audioFrames.poll(220,TimeUnit.MILLISECONDS);
+                        if(packet==null||!running)continue;
+                        long gen=captureGeneration;
+                        if(packet.generation!=gen)continue;
+                        if(previousGeneration!=gen || droppedAudio){
+                            engine.reset();previousGeneration=gen;
+                            droppedAudio=false;
                         }
-                        if(trainingMode)continue;
-                        synchronized(enrollLock){
-                            if(profile.isEnrolling() && !enrollArmed)continue;
+                        for(SherpaVoiceEngine.Clip clip:engine.accept(packet.samples,packet.samples.length)){
+                            if(gen!=captureGeneration)break;
+                            if(profile.isEnrolling() && enrollArmed && enrollDecoder==null){
+                                status="首次声纹采集 · 加载 Vosk 说话人模型…";
+                                publish(null,null,null,false,0f);
+                                enrollDecoder=new EnrollmentDecoder();
+                            }
+                            recognizeSherpaClip(clip,gen,enrollDecoder);
                         }
-                        // Fast path for enrollment: only the full-vocabulary recognizers.
-                        Decoded cn=decodeClip(zh,clip.pcm);
-                        Decoded english=decodeClip(en,clip.pcm);
-                        if(clip.generation!=captureGeneration)continue;
-                        if(profile.isEnrolling()) {
-                            consumeUtterance(cn.text,english.text,"","",cn.speaker,
-                                english.speaker,null);
-                            continue;
-                        }
-                        Decoded focusedCn=focusedZh.recognizer==null?new Decoded("",null):
-                            decodeClip(focusedZh.recognizer,clip.pcm);
-                        Decoded focusedEnglish=focusedEn.recognizer==null?new Decoded("",null):
-                            decodeClip(focusedEn.recognizer,clip.pcm);
-                        if(clip.generation!=captureGeneration)continue;
-                        // Only compare costly personal templates if Vosk first
-                        // proposed an allowed command. Random noise/ordinary
-                        // speech must never be a template-only trigger path.
-                        CommandTemplateStore.Result result=
-                            SpeechFusion.hasAsrHypothesis(cn.text,english.text,
-                                focusedCn.text,focusedEnglish.text,awake)
-                                ? templates.match(clip.pcm) : null;
-                        consumeUtterance(cn.text,english.text,focusedCn.text,
-                            focusedEnglish.text,cn.speaker,english.speaker,result);
                     }
                 }finally{
                     try{mic.stop();}catch(Exception ignored){}
-                    if(ns!=null)ns.release();
-                    if(agc!=null)agc.release();
+                    if(ns!=null)ns.release();if(agc!=null)agc.release();
                     mic.release();recording=null;
                 }
             }
         }catch(Exception ex){
-            if(!running)return;
-            Log.e(TAG,"REx Vosk audio pipeline failed",ex);
-            status="离线语音失败："+ex.getClass().getSimpleName()+" "+String.valueOf(ex.getMessage());
-            publish(null,null,null,false,0f);
-            running=false;stopSelf();
-        }
+            if(running){
+                Log.e(TAG,"REx sherpa-onnx audio pipeline failed",ex);
+                status="神经识别启动失败："+ex.getClass().getSimpleName()+" "+String.valueOf(ex.getMessage());
+                publish(null,null,null,false,0f);
+                running=false;stopSelf();
+            }
+        }finally{if(enrollDecoder!=null)enrollDecoder.close();}
     }
-
-    /** Real-time PCM thread: samples + publishes level BEFORE any ASR decoding. */
+    /** Microphone PCM runs separately; bounded queue drops stale data instead of lagging. */
     private void capturePcm(AudioRecord mic){
-        short[] reusable=new short[800]; // 50ms, 16kHz mono
-        CommandAudioSegmenter segmenter=new CommandAudioSegmenter();
-        CommandActivityGate commandGate=new CommandActivityGate();
-        long seenGeneration=-1;
+        short[] reusable=new short[800];
         try{
             while(running){
-                if(seenGeneration!=captureGeneration){
-                    segmenter.reset();commandGate.reset();
-                    seenGeneration=captureGeneration;
-                }
-                int count=mic.read(reusable,0,reusable.length,AudioRecord.READ_BLOCKING);
+                int n=mic.read(reusable,0,reusable.length,AudioRecord.READ_BLOCKING);
                 if(!running)break;
-                if(count<0)throw new IllegalStateException("mic.read failed " + count);
-                if(count==0)continue;
-                float energy=activityGate.process(reusable,count);
+                if(n<0)throw new IllegalStateException("mic.read failed "+n);
+                if(n==0)continue;
+                float energy=activityGate.process(reusable,n);
                 speaking=activityGate.isActive();
                 long now=SystemClock.elapsedRealtime();
                 if(trainingArmed && now>trainingDeadline){
-                    trainingArmed=false;trainingInfo="采集超时：没有完成一次有效的朗读，请重试";
+                    trainingArmed=false;trainingInfo="采集超时：未取得有效语音，请重试";
                     publishTraining("TRAIN_FAIL");
                 }
-                // Noise/energy alone cannot initiate command capture. Only
-                // sustained speech-like activity opens a candidate segment.
-                boolean commandActivity=commandGate.accept(reusable,count,speaking);
-                short[] utterance=segmenter.accept(reusable,count,commandActivity);
-                if(utterance!=null){
-                    int phrase=-1;
-                    if(trainingMode){
-                        if(trainingArmed){phrase=trainingPhrase;trainingArmed=false;}
-                        else utterance=null;
-                    }
-                    if(utterance!=null){
-                        CommandClip clip=new CommandClip(utterance,phrase,seenGeneration);
-                        if(!commandClips.offer(clip)){
-                            commandClips.poll();commandClips.offer(clip);
-                            status="语音解码负载偏高，已丢弃最早一段；请稍放慢指令节奏";
-                        }
-                    }
-                }
                 synchronized(enrollLock){
-                    if(profile.isEnrolling() && enrollArmed && now>=enrollDeadline){
-                        enrollArmed=false;
-                        status="采集超时：未得到完整提示词，请点击『采集』重试";
+                    if(profile.isEnrolling()&&enrollArmed&&now>=enrollDeadline){
+                        enrollArmed=false;status="声纹采集超时，请点击采集重试";
                         publishEnrollment("CAPTURE_FAIL");
                     }
                 }
+                short[] copy=java.util.Arrays.copyOf(reusable,n);
+                AudioFrame frame=new AudioFrame(copy,captureGeneration);
+                if(!audioFrames.offer(frame)){
+                    audioFrames.clear();droppedAudio=true;
+                    audioFrames.offer(frame); // never combine stale and fresh utterances
+                    status="识别负载较高，已清空过期录音，避免误认";
+                }
                 if(now-lastRealtimeBroadcastMs>=65){
-                    lastRealtimeBroadcastMs=now;
-                    publish(null,null,null,false,energy);
+                    lastRealtimeBroadcastMs=now;publish(null,null,null,false,energy);
                 }
             }
         }catch(Exception e){

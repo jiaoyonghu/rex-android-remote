@@ -50,12 +50,13 @@ public final class RexView extends View {
     private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2,PAGE_TRAIN=3;
     // Voice-page-only transition: native particle positions <-> stable,
     // screen-wide scattering positions. All other page changes remain instant.
-    private static final long PARTICLE_TRANSITION_MS=950;
+    private static final long PARTICLE_TRANSITION_MS=720;
     private final float[] scatterX=new float[1940],scatterY=new float[1940];
     private final float[] scatterCoreX=new float[1248],scatterCoreY=new float[1248];
     private boolean particleTransition,particleGathering;
     private long particleTransitionAt;
     private int page=PAGE_VOICE;
+    private int outgoingPage=-1;
     private int trainIndex,trainCount;
     private boolean trainCapturing;
     private String trainInfo="点击采集，为这条固定指令录音 3 至 5 次";
@@ -63,7 +64,7 @@ public final class RexView extends View {
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v0.9 · 多重语音确认 · 语音红外未授权";
+    private String message="v1.0 · 神经关键词语音 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -160,11 +161,19 @@ public final class RexView extends View {
     }
     private void changePage(int target){
         if(target==page)return;
-        if(page==PAGE_VOICE || target==PAGE_VOICE){
-            particleTransition=true;
-            particleGathering=target==PAGE_VOICE;
+        if(page==PAGE_VOICE && target!=PAGE_VOICE){
+            // v0.9 rendered the NEW page behind still-visible particles. Keep
+            // the voice scene active until the very last scatter frame; then
+            // switch atomically without leaving a single foreground particle.
+            outgoingPage=target;
+            particleTransition=true;particleGathering=false;
             particleTransitionAt=SystemClock.elapsedRealtime();
-        }else particleTransition=false;
+            invalidate();return;
+        }
+        if(target==PAGE_VOICE){
+            outgoingPage=-1;particleTransition=true;particleGathering=true;
+            particleTransitionAt=SystemClock.elapsedRealtime();
+        }else{particleTransition=false;outgoingPage=-1;}
         page=target;
         invalidate();
     }
@@ -338,7 +347,7 @@ public final class RexView extends View {
     private void drawParticleTransition(Canvas c,float progress){
         float e=progress*progress*(3f-2f*progress); // cubic smoothstep
         float scattered=particleGathering?1f-e:e;
-        float fade=particleGathering?(1f-e):(.98f-.83f*e);
+        float fade=particleGathering?(1f-e):(1f-e)*(1f-e);
         drawParticleCloud(c,false,scattered,fade,e);
         drawParticleCloud(c,true,scattered,fade,e);
     }
@@ -468,10 +477,11 @@ public final class RexView extends View {
         center(c,"← 上一条",96,343,13,0xFFFFCDDC,true);
         box(c,188,310,340,361,0xA6382335,10);
         center(c,"下一条 →",264,343,13,0xFFFFCDDC,true);
-        center(c,"已采集 "+trainCount+" / 5 次  ·  至少 3 次启用辅助识别",180,385,10,
+        center(c,"已采集 "+trainCount+" / 5 次 · 可重复采集",180,385,10,
             trainCount>=3?0xFFFFBED0:0xFFB6A2AF,false);
-        box(c,20,400,340,451,trainCount>=5?0x68372233:0xBB5A2842,12);
-        center(c,trainCapturing?"正在采集 · 请朗读后停顿":"点击采集本条口令",180,431,15,0xFFFFDEE9,true);
+        box(c,20,400,340,451,0xBB5A2842,12);
+        center(c,trainCapturing?"正在采集 · 请朗读后停顿":
+            (trainCount>=5?"再次采集 · 自动替换最早一次":"点击采集本条口令"),180,431,15,0xFFFFDEE9,true);
         box(c,20,465,172,511,0xA2362432,10);
         center(c,"清除本条样本",96,493,11,0xFFFFBCC9,false);
         box(c,188,465,340,511,0xA2362432,10);
@@ -506,10 +516,25 @@ public final class RexView extends View {
                 (SystemClock.elapsedRealtime()-particleTransitionAt)
                     /(float)PARTICLE_TRANSITION_MS));
         }
+        boolean leaving=particleTransition && !particleGathering && outgoingPage>=0;
+        if(leaving && transitionProgress>=1f){
+            // The target screen becomes visible on the first frame with ZERO
+            // transition particles. No draw calls can leak over its contents.
+            page=outgoingPage;outgoingPage=-1;
+            particleTransition=false;leaving=false;
+        }
         if(page==PAGE_MANUAL)drawControls(raw);
         else if(page==PAGE_OWNER)drawEnrollment(raw);
         else if(page==PAGE_TRAIN)drawCommandTraining(raw);
-        else {
+        else if(leaving){
+            // Fade the old HUD independently; do not redraw stable filaments
+            // underneath the particles that are already scattering.
+            float e=transitionProgress*transitionProgress*(3f-2f*transitionProgress);
+            int layer=raw.saveLayerAlpha(0,0,W,H,
+                Math.max(0,Math.min(255,(int)(255f*(1f-e)))));
+            voicePanel(raw);
+            raw.restoreToCount(layer);
+        }else {
             if(particleTransition && particleGathering){
                 float e=transitionProgress*transitionProgress*(3f-2f*transitionProgress);
                 int layer=raw.saveLayerAlpha(0,0,W,H,
@@ -570,7 +595,7 @@ public final class RexView extends View {
                     actions.onSelectCommandPhrase(trainIndex);invalidate();return true;
                 }
                 if(y>=400 && y<=451){
-                    if(trainCount<5 && !trainCapturing){
+                    if(!trainCapturing){
                         trainCapturing=true;actions.onCaptureCommandPhrase(trainIndex);
                     }
                     invalidate();return true;

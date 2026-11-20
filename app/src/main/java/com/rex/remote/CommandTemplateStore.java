@@ -68,7 +68,9 @@ public final class CommandTemplateStore {
     public synchronized String add(int phrase,short[] pcm){
         if(phrase<0||phrase>=CommandPhrases.count())return "无效提示词";
         int n=count(phrase);
-        if(n>=MAX_TAKES)return "本条已采满 5 次，可清除后重录";
+        // At five takes, a new supervised recording replaces the oldest;
+        // a single phrase can be re-recorded indefinitely without clearing.
+
         float[][] data=CommandAcoustics.features(pcm);
         if(data==null)return "音频过短、过长、噪声过大或太安静，请重新朗读";
         try{
@@ -85,7 +87,13 @@ public final class CommandTemplateStore {
                 float maxAllowed=Math.max(.72f,Math.min(1.45f,among*1.7f+.20f));
                 if(closest>maxAllowed)return "与本条已录样本差异过大（可能录错词或有噪声），请重录";
             }
-            if(!prefs.edit().putString(key(phrase,n),encode(data)).commit())return "本地保存失败";
+            SharedPreferences.Editor editor=prefs.edit();
+            if(n>=MAX_TAKES){
+                for(int i=1;i<MAX_TAKES;i++)
+                    editor.putString(key(phrase,i-1),prefs.getString(key(phrase,i),""));
+                editor.putString(key(phrase,MAX_TAKES-1),encode(data));
+            }else editor.putString(key(phrase,n),encode(data));
+            if(!editor.commit())return "本地保存失败";
             cache.remove(phrase);
             return null;
         }catch(Exception ex){return "声学特征无法写入，请重录";}
