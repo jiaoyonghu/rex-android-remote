@@ -1,4 +1,4 @@
-name: REx Android v1.0 neural speech APK
+name: REx Android v1.1 speaker-aware wake APK
 on:
   workflow_dispatch:
   push:
@@ -31,7 +31,7 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
-      - name: Prepare pinned sherpa-onnx runtime, bilingual KWS and Silero VAD
+      - name: Prepare sherpa KWS, Silero VAD and pinned CAM++ speaker model
         shell: bash
         run: |
           python -m pip install --disable-pip-version-check "pypinyin==0.55.0"
@@ -43,6 +43,6 @@ jobs:
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: REX-v1.0-neural-kws-debug-APK
+          name: REX-v1.1-owner-wake-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
