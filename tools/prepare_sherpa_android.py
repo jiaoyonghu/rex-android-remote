@@ -163,7 +163,7 @@ def main():
     if not 400_000<len(silero)<5_000_000:raise RuntimeError('Invalid Silero VAD model length')
     selected['silero_vad.onnx']=silero
     speaker_name='3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx'
-    speaker=download(f'{BASE}/speaker-recongition-models/{speaker_name}',35_000_000)
+    speaker=download(f'https://huggingface.co/bitsydarel/campplus-onnx/resolve/main/{speaker_name}',35_000_000)
     if len(speaker)!=28281164: raise RuntimeError('Unexpected CAM++ model size')
     sha256(speaker,'aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2')
     selected['campplus_zh_en.onnx']=speaker
