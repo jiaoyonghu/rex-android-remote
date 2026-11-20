@@ -7,8 +7,8 @@ android {
         applicationId 'com.rex.remote'
         minSdk 29
         targetSdk 36
-        versionCode 10
-        versionName '1.0.0-sherpa-vad-kws'
+        versionCode 11
+        versionName '1.1.0-owner-wake'
         ndk { abiFilters 'arm64-v8a' }
     }
     compileOptions {
@@ -18,84 +18,8 @@ android {
 }
 
 dependencies {
-    // Bundles an offline ASR runtime into the APK; NO system SpeechRecognizer.
-    implementation 'com.alphacephei:vosk-android:0.3.75@aar'
-    implementation 'net.java.dev.jna:jna:5.18.1@aar'
     // Pinned official sherpa-onnx JVM API; GitHub Actions prepares this .jar
     // and its matching arm64 JNI binaries before Gradle runs.
     implementation files('libs/sherpa-onnx-jvm-2.0.2.jar')
 }
 
-// Both ASR models and a dedicated speaker embedding model are embedded in the
-// built APK. Neither model is fetched by the phone. Keep APK artifacts private
-// if you do not want the binary redistributed.
-def modelSpecs = [
-    [name: 'vosk-model-small-cn-0.22', label: 'Mandarin'],
-    [name: 'vosk-model-small-en-us-0.15', label: 'English'],
-    [name: 'vosk-model-spk-0.4', label: 'Speaker embedding', speaker: true]
-]
-def modelAssets = modelSpecs.collect { spec ->
-    file("src/main/assets/${spec.name}.zip")
-}
-tasks.register('prepareRexBundledModels') {
-    outputs.files(modelAssets)
-    doLast {
-        modelSpecs.each { spec ->
-            def zipDest = file("src/main/assets/${spec.name}.zip")
-            def expectedModel = "${spec.name}/am/final.mdl"
-            def expectedConf = "${spec.name}/conf/model.conf"
-            def requiredSpeaker = ['mfcc.conf','final.ext.raw','mean.vec','transform.mat']
-                .collect { "${spec.name}/${it}" }
-            def archiveValid = { f ->
-                if (!f.exists() || f.length() < (spec.speaker ? 5000000L : 20000000L)) return false
-                try {
-                    def z = new java.util.zip.ZipFile(f)
-                    try {
-                        if (spec.speaker)
-                            return requiredSpeaker.every { z.getEntry(it) != null }
-                        return z.getEntry(expectedModel) != null &&
-                            z.getEntry(expectedConf) != null
-                    } finally { z.close() }
-                } catch (Exception ignored) { return false }
-            }
-            if (archiveValid(zipDest)) {
-                println "REx: bundled ${spec.label} model present (${zipDest.length()} bytes)"
-                return
-            }
-            zipDest.parentFile.mkdirs()
-            def temp = file(zipDest.absolutePath + '.part')
-            def url = new URL("https://alphacephei.com/vosk/models/${spec.name}.zip")
-            println "REx: downloading official ${spec.label} model for APK bundling..."
-            try {
-                def conn = url.openConnection()
-                conn.setConnectTimeout(30000)
-                conn.setReadTimeout(180000)
-                conn.getInputStream().withCloseable { ins ->
-                    temp.withOutputStream { out ->
-                        byte[] buf = new byte[32768]
-                        long total = 0
-                        int n
-                        while ((n = ins.read(buf)) != -1) {
-                            total += n
-                            if (total > 75000000L)
-                                throw new GradleException('Vosk model exceeded compressed size limit')
-                            out.write(buf, 0, n)
-                        }
-                    }
-                }
-                if (!archiveValid(temp))
-                    throw new GradleException("Invalid or incomplete ${spec.label} Vosk model")
-                java.nio.file.Files.move(temp.toPath(), zipDest.toPath(),
-                    java.nio.file.StandardCopyOption.REPLACE_EXISTING)
-                println "REx: ${spec.label} offline model bundled successfully"
-            } finally {
-                if (temp.exists()) temp.delete()
-            }
-        }
-    }
-}
-tasks.named('preBuild').configure { dependsOn tasks.named('prepareRexBundledModels') }
-tasks.configureEach {
-    if (name.startsWith('merge') && name.endsWith('Assets'))
-        dependsOn tasks.named('prepareRexBundledModels')
-}

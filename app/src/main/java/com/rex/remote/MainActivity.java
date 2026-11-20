@@ -58,7 +58,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
                 new AlertDialog.Builder(MainActivity.this)
                     .setTitle("声纹录入结束")
                     .setMessage("所有 "+EnrollmentPrompts.count()
-                        +" 条提示词都已通过文本核对和声纹特征检查，已保存到本机。\n\n"
+                        +" 条提示句都已取得有效的 CAM++ 声纹特征，并通过内部一致性检查，已保存到本机。\n\n"
                         +"这是实验性声纹匹配，尚不能防录音重放，也不会授权机器人运动。")
                     .setPositiveButton("完成",null).show();
             }
@@ -107,7 +107,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
     private void startVoice() {
         try {
             startForegroundService(new Intent(this,VoiceService.class));
-            view.setMessage("REx 双语 + 声纹模型启动中 · 首次解压三套内置模型");
+            view.setMessage("REx KWS + VAD + 声纹模型启动中 · 首次解压离线模型");
         } catch(Exception e) {
             view.setMessage("语音启动失败："+e.getClass().getSimpleName());
         }

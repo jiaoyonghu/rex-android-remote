@@ -64,7 +64,7 @@ public final class RexView extends View {
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v1.0 · 神经关键词语音 · 语音红外未授权";
+    private String message="v1.1 · 声纹辅助语音 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";

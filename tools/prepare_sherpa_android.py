@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GitHub Actions: pin sherpa-onnx 2.0.2 Java/JNI, bundle KWS and Silero.
+"""GitHub Actions: pin sherpa-onnx 2.0.2 Java/JNI, KWS, VAD and CAM++ speaker.
 
 Never uploads or modifies a user's audio, templates or model preferences.
 This runs on the BUILD RUNNER before Gradle, not on the phone.
@@ -112,7 +112,12 @@ def make_keywords(tokens, lexicon):
         if not result: raise RuntimeError('Empty keyword: '+label)
         if label=='睡觉' and result!=['sh','uì','j','iào']:
             raise RuntimeError('Contextual pronunciation for 睡觉 is incorrect: '+str(result))
-        out.append(' '.join(result)+' @'+label.replace(' ','_'))
+        # Longer wake phrases get an independent moderate sensitivity setting;
+        # single-syllable Rex stays conservative to avoid false activations.
+        if label in ('Rex醒了吗','灭建国'): args=' :1.2 #0.32'
+        elif label=='Rex': args=' :1.0 #0.40'
+        else: args=' :1.0 #0.40'
+        out.append(' '.join(result)+args+' @'+label.replace(' ','_'))
     print('Prepared',len(out),'distinct exact command phrases, all tokens verified', flush=True)
     return ('\n'.join(out)+'\n').encode('utf-8')
 
@@ -157,11 +162,16 @@ def main():
     silero=download(f'{BASE}/asr-models/silero_vad.onnx', 5_000_000)
     if not 400_000<len(silero)<5_000_000:raise RuntimeError('Invalid Silero VAD model length')
     selected['silero_vad.onnx']=silero
+    speaker_name='3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx'
+    speaker=download(f'{BASE}/speaker-recongition-models/{speaker_name}',35_000_000)
+    if len(speaker)!=28281164: raise RuntimeError('Unexpected CAM++ model size')
+    sha256(speaker,'aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2')
+    selected['campplus_zh_en.onnx']=speaker
     target=ASSETS/(MODEL_DIR+'.zip')
     with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=7) as z:
         for name,body in sorted(selected.items()):
             z.writestr(MODEL_DIR+'/'+name,body)
-    print('Bundled neural KWS + VAD model',target, target.stat().st_size,'bytes')
+    print('Bundled neural KWS + VAD + CAM++ speaker model',target, target.stat().st_size,'bytes')
 
 
 if __name__=='__main__':main()

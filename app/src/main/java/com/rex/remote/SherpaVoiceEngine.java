@@ -7,6 +7,8 @@ import com.k2fsa.sherpa.onnx.OnlineModelConfig;
 import com.k2fsa.sherpa.onnx.OnlineStream;
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
 import com.k2fsa.sherpa.onnx.SileroVadModelConfig;
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor;
+import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig;
 import com.k2fsa.sherpa.onnx.Vad;
 import com.k2fsa.sherpa.onnx.VadModelConfig;
 import java.io.File;
@@ -26,6 +28,8 @@ public final class SherpaVoiceEngine implements AutoCloseable {
         }
     }
     private final KeywordSpotter kws;
+    private final SpeakerEmbeddingExtractor speaker;
+    private static final int MIN_SPEAKER_SAMPLES=16000; // too-short audio is not biometrically reliable
     private OnlineStream stream;
     private final Vad vad;
     private final float[] vadWindow=new float[512];
@@ -49,7 +53,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
             .setOnlineModelConfig(m)
             .setKeywordsFile(new File(folder,"keywords.txt").getAbsolutePath())
             .setMaxActivePaths(4).setKeywordsScore(1.0f)
-            .setKeywordsThreshold(0.40f).setNumTrailingBlanks(2).build();
+            .setKeywordsThreshold(0.40f).setNumTrailingBlanks(1).build();
         kws=new KeywordSpotter(k);
         stream=kws.createStream();
         SileroVadModelConfig s=SileroVadModelConfig.builder()
@@ -61,6 +65,21 @@ public final class SherpaVoiceEngine implements AutoCloseable {
             .setSileroVadModelConfig(s).setSampleRate(16000)
             .setNumThreads(1).setProvider("cpu").setDebug(false).build();
         vad=new Vad(v);
+        SpeakerEmbeddingExtractorConfig sc=SpeakerEmbeddingExtractorConfig.builder()
+            .setModel(new File(folder,"campplus_zh_en.onnx").getAbsolutePath())
+            .setNumThreads(1).setDebug(false).build();
+        speaker=new SpeakerEmbeddingExtractor(sc);
+    }
+    /** At most one on-demand speaker extraction per meaningful long clip. */
+    public float[] speakerEmbedding(short[] pcm){
+        if(pcm==null || pcm.length<MIN_SPEAKER_SAMPLES || pcm.length>80000)return null;
+        float[] samples=new float[pcm.length];
+        for(int i=0;i<pcm.length;i++)samples[i]=pcm[i]/32768f;
+        OnlineStream s=speaker.createStream();
+        try{
+            s.acceptWaveform(samples,16000);s.inputFinished();
+            return SpeakerMath.unit(speaker.compute(s));
+        }finally{s.release();}
     }
     private void addKeyword(String hit){
         if(hit==null || hit.isEmpty())return;
@@ -83,7 +102,13 @@ public final class SherpaVoiceEngine implements AutoCloseable {
         int iterations=0;
         while(kws.isReady(stream) && iterations++<40){
             kws.decode(stream);
-            addKeyword(kws.getResult(stream).getKeyword());
+            String hit=kws.getResult(stream).getKeyword();
+            if(hit!=null && !hit.isEmpty()){
+                addKeyword(hit);
+                // Official sherpa-onnx KWS examples reset immediately after a
+                // hit. The VAD segment is maintained separately.
+                kws.reset(stream);
+            }
         }
         for(float f:audio){
             vadWindow[windowFill++]=f;
@@ -113,6 +138,6 @@ public final class SherpaVoiceEngine implements AutoCloseable {
         kws.reset(stream);vad.reset();keyword="";conflict=false;windowFill=0;completed.clear();
     }
     @Override public void close(){
-        try{stream.release();}finally{try{kws.release();}finally{vad.release();}}
+        try{stream.release();}finally{try{kws.release();}finally{try{vad.release();}finally{speaker.release();}}}
     }
 }

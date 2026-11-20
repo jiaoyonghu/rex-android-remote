@@ -6,11 +6,11 @@ import org.json.JSONArray;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Experimental x-vector similarity display, not identity proof or IR authorization. */
+/** Experimental CAM++ embeddings (v1.1). No replay defense or IR authorization. */
 public final class SpeakerProfile {
-    private static final String PREF="rex_owner_voice_private_v1"; // compatible with v0.7
+    private static final String PREF="rex_owner_sherpa_campplus_v11"; // separate from incompatible Vosk x-vectors
     private static final String VECTOR="owner_embedding";
-    private static final String THRESHOLD="owner_personal_threshold_v8";
+    private static final String THRESHOLD="owner_personal_threshold_v11";
     public static final int MIN_SAMPLES=3,TARGET_SAMPLES=5;
     private static final float OLD_THRESHOLD=.72f;
     private final SharedPreferences prefs;
