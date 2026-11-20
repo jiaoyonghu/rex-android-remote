@@ -32,7 +32,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * REx v0.8: unified utterance-level bilingual ASR + grammar + personal templates,
+ * REx v0.9: fail-closed bilingual ASR + grammar + personal templates,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
@@ -123,7 +123,7 @@ public final class VoiceService extends Service {
             trainingPhrase=Math.max(0,Math.min(CommandPhrases.count()-1,requestedPhrase));
             trainingCount=templates.count(trainingPhrase);
             trainingInfo="『"+CommandPhrases.at(trainingPhrase)+"』已录 "
-                +trainingCount+" / 5 次 · 至少 3 次";
+                +trainingCount+" / 5 次 · 仅辅助交叉确认";
             status="指令个性化训练 · 录音仅保留声学特征，不存原始音频";
             publishTraining("TRAIN_SELECTED");
         }
@@ -243,7 +243,7 @@ public final class VoiceService extends Service {
         try {startForeground(1001,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);}
         catch(Exception e){status="麦克风服务启动失败："+e.getClass().getSimpleName();
             publish(null,null,null,false,0f);stopSelf();return START_NOT_STICKY;}
-        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v8");worker.start();}
+        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-bilingual-voice-v9");worker.start();}
         publish(null,null,null,false,0f);
         return START_NOT_STICKY;
     }
@@ -257,14 +257,31 @@ public final class VoiceService extends Service {
             pcm=audio;this.phrase=phrase;this.generation=generation;
         }
     }
-    private void handleTrainingClip(CommandClip clip){
-        if(!trainingMode || clip.phrase!=trainingPhrase)return;
+    private void handleTrainingClip(CommandClip clip,String zh,String en,
+                                    String focusedZh,String focusedEn){
+        if(!trainingMode || clip.phrase!=trainingPhrase ||
+           clip.generation!=captureGeneration)return;
+        // The record button specifies a *label*, not a supervision signal.
+        // A noise or different spoken word must not silently become a template.
+        // Reject when either unrestricted model recognises a different known
+        // command, and require the target phrase to appear verbatim in ASR or
+        // the focused grammar (not a mere same-action synonym).
+        String expected=RexCommand.norm(CommandPhrases.at(clip.phrase));
+        boolean exact=expected.equals(RexCommand.norm(zh)) ||
+            expected.equals(RexCommand.norm(en)) ||
+            expected.equals(RexCommand.norm(focusedZh)) ||
+            expected.equals(RexCommand.norm(focusedEn));
+        if(!exact){
+            trainingInfo="未核对到『"+CommandPhrases.at(clip.phrase)+"』，没有保存此样本；请清楚朗读后重试";
+            publishTraining("TRAIN_FAIL");
+            return;
+        }
         String failure=templates.add(clip.phrase,clip.pcm);
         if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
         else {
             int n=templates.count(clip.phrase);trainingCount=n;
             trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』采集 " + n
-                +"/5"+(n>=3?" · 已自动参与每次完整语音匹配（不是训练 Vosk）":
+                +"/5"+(n>=3?" · 可辅助交叉确认（模板不会单独触发口令）":
                 " · 再采 "+(3-n)+" 次才生效");
             publishTraining("TRAIN_OK");
         }
@@ -414,14 +431,27 @@ public final class VoiceService extends Service {
                         if(agc!=null)agc.setEnabled(true);
                     }}catch(Exception ex){Log.w(TAG,"AGC unavailable",ex);}
                     mic.startRecording();
-                    updateStatus("离线监听中 · 通用+词表+训练样本统一裁决 · 仅预览");
+                    updateStatus("离线监听中 · 双语模型+个人模板交叉确认 · 拒绝单路猜测 · 仅预览");
                     Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic");
                     capture.start();
                     while(running){
                         CommandClip clip=commandClips.poll(250,TimeUnit.MILLISECONDS);
                         if(!running || clip==null)continue;
                         if(clip.generation!=captureGeneration)continue;
-                        if(clip.phrase>=0){handleTrainingClip(clip);continue;}
+                        if(clip.phrase>=0){
+                            // No more arbitrary audio labelled as a successful
+                            // training take: first check the prompted phrase.
+                            Decoded trainCn=decodeClip(zh,clip.pcm);
+                            Decoded trainEn=decodeClip(en,clip.pcm);
+                            String trainGrZh=focusedZh.recognizer==null?"":
+                                decodeClip(focusedZh.recognizer,clip.pcm).text;
+                            String trainGrEn=focusedEn.recognizer==null?"":
+                                decodeClip(focusedEn.recognizer,clip.pcm).text;
+                            if(clip.generation!=captureGeneration)continue;
+                            handleTrainingClip(clip,trainCn.text,trainEn.text,
+                                trainGrZh,trainGrEn);
+                            continue;
+                        }
                         if(trainingMode)continue;
                         synchronized(enrollLock){
                             if(profile.isEnrolling() && !enrollArmed)continue;
@@ -440,7 +470,13 @@ public final class VoiceService extends Service {
                         Decoded focusedEnglish=focusedEn.recognizer==null?new Decoded("",null):
                             decodeClip(focusedEn.recognizer,clip.pcm);
                         if(clip.generation!=captureGeneration)continue;
-                        CommandTemplateStore.Result result=templates.match(clip.pcm);
+                        // Only compare costly personal templates if Vosk first
+                        // proposed an allowed command. Random noise/ordinary
+                        // speech must never be a template-only trigger path.
+                        CommandTemplateStore.Result result=
+                            SpeechFusion.hasAsrHypothesis(cn.text,english.text,
+                                focusedCn.text,focusedEnglish.text,awake)
+                                ? templates.match(clip.pcm) : null;
                         consumeUtterance(cn.text,english.text,focusedCn.text,
                             focusedEnglish.text,cn.speaker,english.speaker,result);
                     }
@@ -483,8 +519,8 @@ public final class VoiceService extends Service {
                     trainingArmed=false;trainingInfo="采集超时：没有完成一次有效的朗读，请重试";
                     publishTraining("TRAIN_FAIL");
                 }
-                // More sensitive command capture does NOT drive the visible
-                // particle field. ASR and template matching may reject it.
+                // Noise/energy alone cannot initiate command capture. Only
+                // sustained speech-like activity opens a candidate segment.
                 boolean commandActivity=commandGate.accept(reusable,count,speaking);
                 short[] utterance=segmenter.accept(reusable,count,commandActivity);
                 if(utterance!=null){
@@ -602,7 +638,7 @@ public final class VoiceService extends Service {
             cmd=null;wakeEvent=false;
         }else if(wakeEvent){
             awake=true;
-            status="REx 已唤醒 · 来源 "+decision.origin+" · "+diagnostic;
+            status="REx 已唤醒 · 多路确认 "+decision.origin+" · "+diagnostic;
         }else if(cmd==RexCommand.SLEEP){
             awake=false;lastOwnerVerifiedMs=0;
             status="已听到睡觉 · 来源 "+decision.origin+" · 返回待机 · "+diagnostic;
@@ -610,7 +646,8 @@ public final class VoiceService extends Service {
             status="识别「"+cmd.label+"」· 来源 "+decision.origin
                 +" · "+diagnostic+" · 仅预览，不发运动红外";
         }else{
-            status=(awake?"保持唤醒":"待机等待唤醒")+" · "+decision.reason+" · "+diagnostic;
+            status=(awake?"保持唤醒":"待机等待唤醒")+" · "+decision.reason
+                +" · 未确认，未输出动作";
         }
         publish(transcribed,null,cmd,wakeEvent,0f);
     }

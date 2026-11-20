@@ -48,6 +48,13 @@ public final class RexView extends View {
     private final float[] corePx=new float[1248];
     private final float[] corePy=new float[1248];
     private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2,PAGE_TRAIN=3;
+    // Voice-page-only transition: native particle positions <-> stable,
+    // screen-wide scattering positions. All other page changes remain instant.
+    private static final long PARTICLE_TRANSITION_MS=950;
+    private final float[] scatterX=new float[1940],scatterY=new float[1940];
+    private final float[] scatterCoreX=new float[1248],scatterCoreY=new float[1248];
+    private boolean particleTransition,particleGathering;
+    private long particleTransitionAt;
     private int page=PAGE_VOICE;
     private int trainIndex,trainCount;
     private boolean trainCapturing;
@@ -56,7 +63,7 @@ public final class RexView extends View {
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v0.8 · 语音识别增强 · 语音红外未授权";
+    private String message="v0.9 · 多重语音确认 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -125,6 +132,11 @@ public final class RexView extends View {
                 coreSwarm.add(new Particle(r,theta,phi));
             }
         }
+        // Stratified random points cover the *entire* screen, including corners,
+        // when the voice field disperses. Fixed destinations avoid visual jumps.
+        Random scatterRandom=new Random(90731);
+        initScatter(scatterRandom,scatterX,scatterY);
+        initScatter(scatterRandom,scatterCoreX,scatterCoreY);
         add(121,165,239,225,"↑ 前进","0.6 m/s",RexCommand.FORWARD);
         add(20,237,119,299,"← 左移","0.4 m/s",RexCommand.LEFT);
         add(122,237,238,299,"■ 停止","站立保持",RexCommand.STOP);
@@ -139,6 +151,22 @@ public final class RexView extends View {
         add(20,585,172,639,"激活","ACTIVE",RexCommand.ACTIVE);
         add(188,585,340,639,"失能 · 高风险","二次确认",RexCommand.DISABLE);
         setLayerType(View.LAYER_TYPE_HARDWARE,null);
+    }
+    private static void initScatter(Random random,float[] xs,float[] ys){
+        for(int i=0;i<xs.length;i++){
+            xs[i]=5f+random.nextFloat()*(W-10f);
+            ys[i]=6f+random.nextFloat()*(H-12f);
+        }
+    }
+    private void changePage(int target){
+        if(target==page)return;
+        if(page==PAGE_VOICE || target==PAGE_VOICE){
+            particleTransition=true;
+            particleGathering=target==PAGE_VOICE;
+            particleTransitionAt=SystemClock.elapsedRealtime();
+        }else particleTransition=false;
+        page=target;
+        invalidate();
     }
     private void add(float l,float t,float r,float b,String title,String sub,RexCommand cmd){
         controls.add(new TouchButton(l,t,r,b,title,sub,cmd));
@@ -172,7 +200,8 @@ public final class RexView extends View {
         if(currentStep>=EnrollmentPrompts.count())enrollmentDone=true;
         awake=awakeNow;
         speaking=speakingNow;
-        if(wakeEvent && page!=PAGE_OWNER && page!=PAGE_TRAIN) page=PAGE_VOICE; // never interrupt enrollment
+        if(wakeEvent && page!=PAGE_OWNER && page!=PAGE_TRAIN)
+            changePage(PAGE_VOICE); // never interrupt enrollment
         if(text!=null){
             lastText=text;
             if("SLEEP".equals(command))commandText="已听到『睡觉』 · 回待机";
@@ -304,6 +333,43 @@ public final class RexView extends View {
             i++;
         }
     }
+    /** Smoothly moves each filament particle between the actual voice mesh and
+     * a deterministic screen-wide distribution. The page itself is unchanged. */
+    private void drawParticleTransition(Canvas c,float progress){
+        float e=progress*progress*(3f-2f*progress); // cubic smoothstep
+        float scattered=particleGathering?1f-e:e;
+        float fade=particleGathering?(1f-e):(.98f-.83f*e);
+        drawParticleCloud(c,false,scattered,fade,e);
+        drawParticleCloud(c,true,scattered,fade,e);
+    }
+    private void drawParticleCloud(Canvas c,boolean inner,float scatter,float fade,float eased){
+        ArrayList<Particle> particles=inner?coreSwarm:swarm;
+        float[] meshX=inner?corePx:px,meshY=inner?corePy:py;
+        float[] destX=inner?scatterCoreX:scatterX,destY=inner?scatterCoreY:scatterY;
+        float linkStrength=particleGathering
+            ? Math.max(0f,(eased-.62f)/.38f)
+            : Math.max(0f,1f-eased*3f);
+        int strandLength=inner?16:20;
+        float lastX=0f,lastY=0f;
+        for(int i=0;i<particles.size();i++){
+            Particle point=particles.get(i);
+            float x=meshX[i]+(destX[i]-meshX[i])*scatter;
+            float y=meshY[i]+(destY[i]-meshY[i])*scatter;
+            int alpha=Math.max(0,Math.min(210,
+                (int)((inner?166:132)*point.brightness*fade)));
+            int red=255,green=inner?144:111,blue=inner?189:147;
+            solid(Color.argb(alpha,red,green,blue));
+            c.drawCircle(x,y,(inner?.50f:.70f)+point.thickness*.50f,paint);
+            if(linkStrength>0 && i%strandLength!=0){
+                float dx=x-lastX,dy=y-lastY;
+                if(dx*dx+dy*dy<2500f)
+                    line(c,lastX,lastY,x,y,
+                        Color.argb((int)(alpha*.37f*linkStrength),red,green,blue),
+                        inner?.27f:.36f);
+            }
+            lastX=x;lastY=y;
+        }
+    }
     private void filaments(Canvas c,float seconds){
         float target=awake?1f:0f;
         activeBlend+=(target-activeBlend)*.08f;
@@ -419,12 +485,12 @@ public final class RexView extends View {
         text(c,"每次只念一条；失败可以重采；录过的样本保存在本机",28,690,8,0xFFAC8796,false);
     }
     public void openCommandTraining(){
-        page=PAGE_TRAIN;trainIndex=0;trainCount=0;trainCapturing=false;
+        changePage(PAGE_TRAIN);trainIndex=0;trainCount=0;trainCapturing=false;
         trainInfo="请选择口令，点击采集并朗读；至少录 3 次";
         invalidate();
     }
     public void openEnrollment(){
-        page=PAGE_OWNER;enrollStep=0;enrollReady=false;enrollmentDone=false;
+        changePage(PAGE_OWNER);enrollStep=0;enrollReady=false;enrollmentDone=false;
         enrollmentCapturing=false;lastText="按『采集』后朗读第一条提示词";invalidate();
     }
     public void setEnrollmentMessage(String text){lastText=text;invalidate();}
@@ -434,10 +500,28 @@ public final class RexView extends View {
         raw.scale(getWidth()/(float)W,getHeight()/(float)H);
         background(raw);
         float t=(SystemClock.elapsedRealtime()-startedAt)/1000f;
+        float transitionProgress=1f;
+        if(particleTransition){
+            transitionProgress=Math.max(0f,Math.min(1f,
+                (SystemClock.elapsedRealtime()-particleTransitionAt)
+                    /(float)PARTICLE_TRANSITION_MS));
+        }
         if(page==PAGE_MANUAL)drawControls(raw);
         else if(page==PAGE_OWNER)drawEnrollment(raw);
         else if(page==PAGE_TRAIN)drawCommandTraining(raw);
-        else {filaments(raw,t);voicePanel(raw);}
+        else {
+            if(particleTransition && particleGathering){
+                float e=transitionProgress*transitionProgress*(3f-2f*transitionProgress);
+                int layer=raw.saveLayerAlpha(0,0,W,H,
+                    Math.min(255,Math.max(0,(int)(255f*e))));
+                filaments(raw,t);voicePanel(raw);
+                raw.restoreToCount(layer);
+            }else{filaments(raw,t);voicePanel(raw);}
+        }
+        if(particleTransition){
+            drawParticleTransition(raw,transitionProgress);
+            if(transitionProgress>=1f)particleTransition=false;
+        }
         raw.restoreToCount(count);
         voiceLevel*=.91f;
         if(voiceLevel<.009f)voiceLevel=0;
@@ -457,8 +541,7 @@ public final class RexView extends View {
                     leftTaps=0;
                     if(page==PAGE_OWNER)actions.onCancelVoiceEnrollment();
                     if(page==PAGE_TRAIN)actions.onFinishCommandTraining();
-                    page=(page==PAGE_MANUAL)?PAGE_VOICE:PAGE_MANUAL;
-                    invalidate();
+                    changePage((page==PAGE_MANUAL)?PAGE_VOICE:PAGE_MANUAL);
                 }
                 return true;
             }
@@ -468,7 +551,7 @@ public final class RexView extends View {
                 if(rightTaps>=3){
                     rightTaps=0;
                     if(page==PAGE_OWNER){
-                        actions.onCancelVoiceEnrollment();page=PAGE_VOICE;
+                        actions.onCancelVoiceEnrollment();changePage(PAGE_VOICE);
                     }else if(page==PAGE_TRAIN){
                         actions.onFinishCommandTraining();openEnrollment();actions.onEnrollVoice();
                     }else{
@@ -513,7 +596,7 @@ public final class RexView extends View {
                 }
                 if(y>=482 && y<=521){
                     if(x>=20 && x<=172){actions.onCancelVoiceEnrollment();openEnrollment();actions.onEnrollVoice();}
-                    else if(x>=188 && x<=340){actions.onCancelVoiceEnrollment();page=PAGE_VOICE;invalidate();}
+                    else if(x>=188 && x<=340){actions.onCancelVoiceEnrollment();changePage(PAGE_VOICE);}
                     return true;
                 }
                 return true;
