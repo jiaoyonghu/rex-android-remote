@@ -27,7 +27,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 /**
- * REx v1.1: sherpa KWS + Silero VAD + CAM++ speaker matching + wake templates,
+ * REx v1.2: KWS + Silero VAD + openWakeWord deep personal command classifier,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
@@ -80,12 +80,13 @@ public final class VoiceService extends Service {
     private volatile AudioRecord recording;
     private Thread worker;
     private SpeakerProfile profile;
-    private CommandTemplateStore templates;
+    private CommandTemplateStore templates; // old MFCC data retained
+    private PersonalNeuralStore neural;
     private volatile boolean trainingMode,trainingArmed;
     private volatile int trainingPhrase;
     private volatile int trainingCount;
     private volatile long trainingDeadline;
-    private volatile String trainingInfo="当前口令未训练 · 至少采集 3 次";
+    private volatile String trainingInfo="当前口令未训练 · 新版至少6次，建议12次";
     private final ArrayBlockingQueue<CommandClip> commandClips=new ArrayBlockingQueue<>(8);
     private volatile long captureGeneration;
     private long lastRealtimeBroadcastMs;
@@ -93,7 +94,7 @@ public final class VoiceService extends Service {
     private String lastFinalSignature="";
     private volatile long lastOwnerVerifiedMs;
     private final SpeechActivityGate activityGate=new SpeechActivityGate();
-    private final PersonalWakePolicy personalWake=new PersonalWakePolicy();
+    private final NeuralWakePolicy neuralWake=new NeuralWakePolicy();
     private final Object enrollLock=new Object();
     private int enrollStep;
     private boolean enrollArmed,enrollReady;
@@ -101,11 +102,12 @@ public final class VoiceService extends Service {
     private static final long CAPTURE_TIMEOUT_MS=19000;
 
     @Override public void onCreate(){super.onCreate();profile=new SpeakerProfile(this);templates=new CommandTemplateStore(this);
-        if(profile.hasProfile())ownerStatus="新版 CAM++ 声纹已录入 · 待验证";
+        neural=new PersonalNeuralStore(this);
+        if(profile.hasProfile())ownerStatus="CAM++ 声纹已录入 · 仅供声纹页参考，不强制限制指令";
         else if(getSharedPreferences("rex_owner_voice_private_v1",MODE_PRIVATE)
                 .contains("owner_embedding"))
             ownerStatus="检测到旧版 Vosk 声纹：模型不兼容，请在原声纹页重新录入5条";
-        trainingCount=templates.count(0);
+        trainingCount=neural.count(0);
     }
 
     @Override public int onStartCommand(Intent intent,int flags,int startId){
@@ -115,12 +117,12 @@ public final class VoiceService extends Service {
         int requestedPhrase=intent==null?0:intent.getIntExtra(EXTRA_TRAIN_INDEX,0);
         if(ACTION_TRAIN_BEGIN.equals(action)||ACTION_TRAIN_SELECT.equals(action)){
             trainingMode=true;trainingArmed=false;
-            commandClips.clear();captureGeneration++;personalWake.clear();
+            commandClips.clear();captureGeneration++;neuralWake.clear();
             trainingPhrase=Math.max(0,Math.min(CommandPhrases.count()-1,requestedPhrase));
-            trainingCount=templates.count(trainingPhrase);
+            trainingCount=neural.count(trainingPhrase);
             trainingInfo="『"+CommandPhrases.at(trainingPhrase)+"』已录 "
-                +trainingCount+" / 5 次 · 可重新采集，满5次自动替换最旧样本";
-            status="指令个性化训练 · 录音仅保留声学特征，不存原始音频";
+                +trainingCount+" / 20 次 · 至少6次启用，建议12次，满20次滚动替换";
+            status="openWakeWord 神经特征训练 · 只在本机保存特征，不存原始录音";
             publishTraining("TRAIN_SELECTED");
         }
         if(ACTION_TRAIN_CAPTURE.equals(action)){
@@ -137,7 +139,7 @@ public final class VoiceService extends Service {
         }
         if(ACTION_TRAIN_CLEAR.equals(action)){
             if(trainingMode && requestedPhrase==trainingPhrase){
-                templates.clear(trainingPhrase);trainingCount=0;trainingArmed=false;
+                neural.clear(trainingPhrase);trainingCount=0;trainingArmed=false;
                 trainingInfo="本条已清空，请点击『采集』重新朗读";
                 publishTraining("TRAIN_CLEARED");
             }
@@ -145,7 +147,7 @@ public final class VoiceService extends Service {
         }
         if(ACTION_TRAIN_END.equals(action)){
             trainingMode=false;trainingArmed=false;
-            commandClips.clear();captureGeneration++;personalWake.clear();
+            commandClips.clear();captureGeneration++;neuralWake.clear();
             trainingInfo="已退出指令训练 · 已录样本保存在本机";
             publishTraining("TRAIN_EXIT");
             return START_NOT_STICKY;
@@ -236,7 +238,7 @@ public final class VoiceService extends Service {
         try {startForeground(1001,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);}
         catch(Exception e){status="麦克风服务启动失败："+e.getClass().getSimpleName();
             publish(null,null,null,false,0f);stopSelf();return START_NOT_STICKY;}
-        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-sherpa-voice-v11");worker.start();}
+        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-sherpa-voice-v12");worker.start();}
         publish(null,null,null,false,0f);
         return START_NOT_STICKY;
     }
@@ -250,20 +252,22 @@ public final class VoiceService extends Service {
             pcm=audio;this.phrase=phrase;this.generation=generation;
         }
     }
-    private void handleTrainingClip(CommandClip clip){
+    private void handleTrainingClip(CommandClip clip,OpenWakeWordFeatures features){
         if(!trainingMode || clip.phrase!=trainingPhrase ||
            clip.generation!=captureGeneration)return;
         // Exact-transcript gating rejected the owner's accent. A
         // supervised recording button supplies the label; use actual audio
         // quality and within-phrase consistency checks instead. It is NOT
         // subsequently allowed to trigger an action without KWS evidence.
-        String failure=templates.add(clip.phrase,clip.pcm);
+        float[] vector=features.embed(clip.pcm);
+        String failure=neural.add(clip.phrase,vector);
         if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
         else {
-            int n=templates.count(clip.phrase);trainingCount=n;
+            int n=neural.count(clip.phrase);trainingCount=n;
             trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』已采集 "+n+
-                "/5"+(n>=3?" · 已参与关键词交叉验证 · 可继续采集替换旧样本":
-                " · 还需 "+(3-n)+" 次");
+                "/20"+(n>=PersonalNeuralStore.MIN_TAKES?
+                " · 个人神经模型已参与识别，建议录至12次":
+                " · 还需 "+(PersonalNeuralStore.MIN_TAKES-n)+" 次");
             publishTraining("TRAIN_OK");
         }
     }
@@ -320,99 +324,95 @@ public final class VoiceService extends Service {
         AudioFrame(short[] samples,long generation){this.samples=samples;this.generation=generation;}
     }
     private void recognizeSherpaClip(SherpaVoiceEngine.Clip clip,long generation,
-                                      SherpaVoiceEngine engine){
+                                      SherpaVoiceEngine engine,OpenWakeWordFeatures features){
         if(generation!=captureGeneration)return;
         if(trainingMode){
             if(trainingArmed && SystemClock.elapsedRealtime()<=trainingDeadline){
                 trainingArmed=false;
-                handleTrainingClip(new CommandClip(clip.pcm,trainingPhrase,generation));
+                handleTrainingClip(new CommandClip(clip.pcm,trainingPhrase,generation),features);
             }
             return;
         }
         if(profile.isEnrolling()){
             if(!enrollArmed)return;
             float[] speaker=engine.speakerEmbedding(clip.pcm);
-            if(generation==captureGeneration)
-                consumeEnrollment(speaker);
+            if(generation==captureGeneration)consumeEnrollment(speaker);
             return;
         }
-        // KWS is normally the initiator. When ASR misses an enrolled wake word,
-        // a HIGH-confidence owner-specific *wake* template can propose a
-        // candidate, but ONLY a newly verified long CAM++ embedding can accept it.
-        CommandTemplateStore.Result personal=null;
-        String proposed=clip.keyword;
-        boolean fallback=false,shortTwoHit=false;
-        if(!clip.conflictingKeywords && !proposed.isEmpty()){
-            personalWake.clear();
-            personal=templates.match(clip.pcm);
-        }
-        else if(!clip.conflictingKeywords && !awake){
-            CommandTemplateStore.Result possible=templates.match(clip.pcm);
-            int takes=possible.candidateIndex>=0?
-                templates.count(possible.candidateIndex):0;
-            PersonalWakePolicy.Result recovery=personalWake.evaluate(
-                possible,takes,clip.pcm.length,SystemClock.elapsedRealtime());
-            if(recovery.found()){
-                personal=possible;
-                proposed=recovery.phrase;
-                fallback=true;shortTwoHit=recovery.twoShort;
-            }else if(recovery.awaitSecond){
-                status="检测到个人短唤醒的第1次匹配 · 请在3.5秒内再说一遍";
-                publish("个人短唤醒待二次确认",null,null,false,0f);
-            }
-        }
-        SherpaCommandPolicy.Decision k=SherpaCommandPolicy.decide(
-            proposed,awake,personal,clip.conflictingKeywords);
-        if(k.command==null && !k.wake && !fallback && proposed.isEmpty())return;
         long now=SystemClock.elapsedRealtime();
-        boolean registered=profile.hasProfile();
-        // Computing a speaker embedding for every noise segment would raise
-        // latency. Only KWS candidates, accepted wake rescue and enrollment
-        // receive a costly speaker check.
-        float[] embedding=registered && (k.command!=null || k.wake || fallback)
-            ?engine.speakerEmbedding(clip.pcm):null;
-        SpeakerProfile.Match match=embedding==null?null:profile.verify(embedding);
-        VoiceIdentityPolicy.Speaker sp=registered?
-            (match==null?VoiceIdentityPolicy.Speaker.TOO_SHORT:
-                match.verified?VoiceIdentityPolicy.Speaker.MATCH:
-                               VoiceIdentityPolicy.Speaker.MISMATCH):
-                VoiceIdentityPolicy.Speaker.NO_PROFILE;
-        boolean session=lastOwnerVerifiedMs>0 && now-lastOwnerVerifiedMs<VoiceIdentityPolicy.SESSION_MS;
-        VoiceIdentityPolicy.Decision d=VoiceIdentityPolicy.decide(k,sp,session,fallback&&!shortTwoHit);
-        String signature=String.valueOf(k.command)+"|"+k.wake+"|"+
-            RexCommand.norm(proposed)+"|"+fallback+"|"+shortTwoHit;
-        if(signature.equals(lastFinalSignature) && now-lastFinalMs<750)return;
-        lastFinalSignature=signature;lastFinalMs=now;
-        if(d.refreshSession)lastOwnerVerifiedMs=now;
-        if(match!=null)ownerStatus=(match.verified?"声纹相符":"声纹不符")+
-            " · CAM++ 相似度 "+String.format(java.util.Locale.ROOT,"%.2f",match.similarity)+
-            " / 阈值 "+String.format(java.util.Locale.ROOT,"%.2f",match.threshold)+
-            "（非防录音重放认证）";
-        else if(registered)ownerStatus=session?
-            "本句较短，使用近期已核对的声纹会话（非独立认证）":
-            "本句未取得可靠声纹：请说『Rex醒了吗』较长唤醒词";
-        else ownerStatus="新版声纹未录入 · 仅显示命令候选";
-        if(d.wake || (d.command!=null &&
-                RexCommand.stripWakePrefix(proposed)!=null &&
-                !RexCommand.stripWakePrefix(proposed).isEmpty()))awake=true;
-        if(d.command==RexCommand.SLEEP){
-            awake=false;lastOwnerVerifiedMs=0;
+        String keyword=clip.keyword;
+        SherpaCommandPolicy.Decision kws=SherpaCommandPolicy.decide(
+            keyword,awake,null,clip.conflictingKeywords);
+        if(clip.conflictingKeywords){neuralWake.clear();return;}
+        boolean trained=false;
+        for(int i=0;i<CommandPhrases.count();i++){
+            if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES){trained=true;break;}
         }
-        if(d.wake)status="REx 已唤醒 · "+d.explanation+
-            (shortTwoHit?" · 双次短唤醒仅激活界面":fallback?" · 个人长唤醒模板补救":"");
-        else if(d.command==RexCommand.SLEEP)status="已睡眠 · 已清除声纹会话";
-        else if(d.command!=null)status="识别『"+d.command.label+"』· "+d.explanation+
+        PersonalNeuralStore.Result match=trained?
+            neural.evaluate(features.embed(clip.pcm)):null;
+        RexCommand command=kws.command;
+        boolean wake=kws.wake;
+        String explanation=kws.reason;
+        if(match!=null && match.accepted){
+            RexCommand learned=CommandPhrases.command(match.phrase);
+            if(command!=null && learned!=null && learned!=command &&
+               match.score>=match.threshold+.03f){
+                command=null;wake=false;
+                explanation="神经模型与 KWS 指向不同动作，已拒绝";
+            }else if(!wake && command==null && learned==RexCommand.WAKE && !awake &&
+                match.score>=match.threshold+.07f){
+                if(neuralWake.accept(match.phrase,now)){
+                    wake=true;explanation="个人神经唤醒两次强匹配 · 非身份认证";
+                }else{
+                    status="个人神经唤醒第1次匹配，请在4秒内再说一次";
+                    publish("个人神经唤醒待确认",null,null,false,0f);
+                    return;
+                }
+            }else if(!wake && command==null && awake && learned!=null &&
+                    learned!=RexCommand.WAKE && learned!=RexCommand.DISABLE &&
+                    match.samples>=PersonalNeuralStore.RECOMMENDED_TAKES &&
+                    match.score>=match.threshold+.09f &&
+                    match.runnerUp>=0 && match.score-match.second>=.12f){
+                // Strong personalised rescue is PREVIEW ONLY, not IR or motors.
+                String trainedPhrase=CommandPhrases.at(match.phrase);
+                if(!"退".equals(trainedPhrase) && !"停".equals(trainedPhrase)){
+                    command=learned;
+                    explanation="个人神经关键词强匹配 · 仅预览";
+                }
+            }else if(command!=null && learned==command){
+                explanation="KWS + openWakeWord 神经个性化一致";
+            }
+        }else if(!keyword.isEmpty())neuralWake.clear();
+        if(!wake && command==null){
+            if(!keyword.isEmpty()){
+                status="未输出口令 · "+explanation;
+                publish("关键词: "+keyword,null,null,false,0f);
+            }
+            return;
+        }
+        if(wake)neuralWake.clear();
+        String signature=String.valueOf(command)+"|"+wake+"|"+keyword;
+        if(signature.equals(lastFinalSignature)&&now-lastFinalMs<750)return;
+        lastFinalSignature=signature;lastFinalMs=now;
+        if(wake || (command!=null && RexCommand.stripWakePrefix(keyword)!=null &&
+                   !RexCommand.stripWakePrefix(keyword).isEmpty()))awake=true;
+        if(command==RexCommand.SLEEP){awake=false;lastOwnerVerifiedMs=0;}
+        ownerStatus="个人口令神经模型（非身份认证） · CAM++ 仅在声纹页录入";
+        if(wake)status="REx 已唤醒 · "+explanation;
+        else if(command==RexCommand.SLEEP)status="已睡眠";
+        else status="识别『"+command.label+"』· "+explanation+
             " · 仅预览，不发送运动红外";
-        else status="未输出口令 · "+d.explanation;
-        publish("关键词: "+clip.keyword+(fallback?" | 个人唤醒: "+proposed:""),
-            null,d.command,d.wake,0f);
+        publish("关键词: "+keyword+(match!=null?" | 神经得分 " +
+                String.format(java.util.Locale.ROOT,"%.2f",match.score):""),
+            null,command,wake,0f);
     }
     private void recognitionLoop(){
         try{
             File kwsDir=unpackSherpaModel();
             if(!running)return;
-            updateStatus("正在启动 Zipformer 关键词 + Silero VAD + CAM++ 声纹模型…");
-            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir)){
+            updateStatus("启动 Zipformer KWS + Silero VAD + openWakeWord 个人神经模型…");
+            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir);
+                OpenWakeWordFeatures personalFeatures=new OpenWakeWordFeatures(this)){
                 int minimum=AudioRecord.getMinBufferSize(SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
                 if(minimum<=0)throw new IllegalStateException("不支持16kHz麦克风");
@@ -433,8 +433,8 @@ public final class VoiceService extends Service {
                         if(agc!=null)agc.setEnabled(true);
                     }}catch(Exception ex){Log.w(TAG,"AGC unavailable",ex);}
                     mic.startRecording();
-                    updateStatus("流式离线监听 · KWS + VAD + 按需声纹复核 · 仅预览");
-                    Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic-v11");
+                    updateStatus("流式监听 · KWS + VAD + 个人神经口令 · 仅预览");
+                    Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic-v12");
                     capture.start();
                     long previousGeneration=-1;
                     while(running){
@@ -448,7 +448,7 @@ public final class VoiceService extends Service {
                         }
                         for(SherpaVoiceEngine.Clip clip:engine.accept(packet.samples,packet.samples.length)){
                             if(gen!=captureGeneration)break;
-                            recognizeSherpaClip(clip,gen,engine);
+                            recognizeSherpaClip(clip,gen,engine,personalFeatures);
                         }
                     }
                 }finally{
@@ -459,7 +459,7 @@ public final class VoiceService extends Service {
             }
         }catch(Exception ex){
             if(running){
-                Log.e(TAG,"REx sherpa-onnx + CAM++ audio pipeline failed",ex);
+                Log.e(TAG,"REx KWS/openWakeWord audio pipeline failed",ex);
                 status="神经识别启动失败："+ex.getClass().getSimpleName()+" "+String.valueOf(ex.getMessage());
                 publish(null,null,null,false,0f);
                 running=false;stopSelf();

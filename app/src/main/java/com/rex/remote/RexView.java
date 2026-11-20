@@ -59,12 +59,12 @@ public final class RexView extends View {
     private int outgoingPage=-1;
     private int trainIndex,trainCount;
     private boolean trainCapturing;
-    private String trainInfo="点击采集，为这条固定指令录音 3 至 5 次";
+    private String trainInfo="点击采集，为这条固定指令录音至少6次，建议12至20次";
     private int enrollStep;
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v1.1 · 声纹辅助语音 · 语音红外未授权";
+    private String message="v1.2 · 个人神经口令 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -441,7 +441,7 @@ public final class RexView extends View {
             center(c,EnrollmentPrompts.at(Math.max(0,Math.min(enrollStep,EnrollmentPrompts.count()-1))),
                 180,289,EnrollmentPrompts.at(Math.max(0,Math.min(enrollStep,EnrollmentPrompts.count()-1))).length()>16?13:15,
                 0xFFFFE5EB,true);
-            center(c,"点击『采集』后朗读，等待本地识别核对",180,323,10,0xFFC3A3AF,false);
+            center(c,"点击『采集』朗读，只采样有效声音特征",180,323,10,0xFFC3A3AF,false);
         }
         box(c,20,377,172,442,enrollmentDone?0x6643212B:0xAD50263B,12);
         center(c,"采 集",96,413,16,0xFFFFD9E4,true);
@@ -468,7 +468,7 @@ public final class RexView extends View {
     }
     private void drawCommandTraining(Canvas c){
         center(c,"个性化口令训练 / COMMAND TRAINING",180,187,15,0xFFFFC6D7,true);
-        center(c,"训练录音不重训神经网络 · 只学习你的原定口令",180,211,9,0xFFCDA8B9,false);
+        center(c,"openWakeWord 深层语音特征 · 个人分类器持续训练",180,211,9,0xFFCDA8B9,false);
         box(c,20,231,340,300,0xAD2C1C2C,12);
         center(c,"第 "+(trainIndex+1)+" / "+CommandPhrases.count()+" 条口令",180,250,10,0xFFC9AAB7,false);
         center(c,CommandPhrases.at(trainIndex),180,276,
@@ -477,11 +477,11 @@ public final class RexView extends View {
         center(c,"← 上一条",96,343,13,0xFFFFCDDC,true);
         box(c,188,310,340,361,0xA6382335,10);
         center(c,"下一条 →",264,343,13,0xFFFFCDDC,true);
-        center(c,"已采集 "+trainCount+" / 5 次 · 可重复采集",180,385,10,
-            trainCount>=3?0xFFFFBED0:0xFFB6A2AF,false);
+        center(c,"已采集 "+trainCount+" / 20 次 · 可重复采集",180,385,10,
+            trainCount>=PersonalNeuralStore.MIN_TAKES?0xFFFFBED0:0xFFB6A2AF,false);
         box(c,20,400,340,451,0xBB5A2842,12);
         center(c,trainCapturing?"正在采集 · 请朗读后停顿":
-            (trainCount>=5?"再次采集 · 自动替换最早一次":"点击采集本条口令"),180,431,15,0xFFFFDEE9,true);
+            (trainCount>=PersonalNeuralStore.MAX_TAKES?"再次采集 · 自动替换最早一次":"点击采集本条口令"),180,431,15,0xFFFFDEE9,true);
         box(c,20,465,172,511,0xA2362432,10);
         center(c,"清除本条样本",96,493,11,0xFFFFBCC9,false);
         box(c,188,465,340,511,0xA2362432,10);

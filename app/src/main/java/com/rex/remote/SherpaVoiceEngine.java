@@ -28,7 +28,8 @@ public final class SherpaVoiceEngine implements AutoCloseable {
         }
     }
     private final KeywordSpotter kws;
-    private final SpeakerEmbeddingExtractor speaker;
+    private SpeakerEmbeddingExtractor speaker;
+    private final File folder;
     private static final int MIN_SPEAKER_SAMPLES=16000; // too-short audio is not biometrically reliable
     private OnlineStream stream;
     private final Vad vad;
@@ -38,6 +39,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
     private boolean conflict;
     private final List<Clip> completed=new ArrayList<>();
     public SherpaVoiceEngine(File folder){
+        this.folder=folder;
         String prefix="epoch-13-avg-2-chunk-16-left-64";
         OnlineTransducerModelConfig t=OnlineTransducerModelConfig.builder()
             .setEncoder(new File(folder,"encoder-"+prefix+".int8.onnx").getAbsolutePath())
@@ -65,14 +67,17 @@ public final class SherpaVoiceEngine implements AutoCloseable {
             .setSileroVadModelConfig(s).setSampleRate(16000)
             .setNumThreads(1).setProvider("cpu").setDebug(false).build();
         vad=new Vad(v);
-        SpeakerEmbeddingExtractorConfig sc=SpeakerEmbeddingExtractorConfig.builder()
-            .setModel(new File(folder,"campplus_zh_en.onnx").getAbsolutePath())
-            .setNumThreads(1).setDebug(false).build();
-        speaker=new SpeakerEmbeddingExtractor(sc);
+
     }
     /** At most one on-demand speaker extraction per meaningful long clip. */
     public float[] speakerEmbedding(short[] pcm){
         if(pcm==null || pcm.length<MIN_SPEAKER_SAMPLES || pcm.length>80000)return null;
+        if(speaker==null){
+            SpeakerEmbeddingExtractorConfig sc=SpeakerEmbeddingExtractorConfig.builder()
+                .setModel(new File(folder,"campplus_zh_en.onnx").getAbsolutePath())
+                .setNumThreads(1).setDebug(false).build();
+            speaker=new SpeakerEmbeddingExtractor(sc);
+        }
         float[] samples=new float[pcm.length];
         for(int i=0;i<pcm.length;i++)samples[i]=pcm[i]/32768f;
         OnlineStream s=speaker.createStream();
@@ -138,6 +143,6 @@ public final class SherpaVoiceEngine implements AutoCloseable {
         kws.reset(stream);vad.reset();keyword="";conflict=false;windowFill=0;completed.clear();
     }
     @Override public void close(){
-        try{stream.release();}finally{try{kws.release();}finally{try{vad.release();}finally{speaker.release();}}}
+        try{stream.release();}finally{try{kws.release();}finally{try{vad.release();}finally{if(speaker!=null)speaker.release();}}}
     }
 }

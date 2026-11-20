@@ -1,40 +1,51 @@
-# REx Android v0.3 — 独立离线监听与双层粒子
+# REx Android v1.2 — 个人神经口令实验版
 
-适配目标：一加 Ace 3V / PJF110，Android 16 / ColorOS 16.0.5。
+## 核心说明（请先读）
 
-## 这次真正改了什么
+本版**不改变原来四页布局、粒子转场、手动红外、固定25条口令**。它针对“录了声纹还是老误拒绝、KWS偶尔漏听本人发音”做了一次声音处理改造。
 
-1. `app/src/main/java/com/rex/remote/VoiceService.java`：删除对 Android `SpeechRecognizer` 的依赖，改为 **内置 Vosk 中文识别库 + `AudioRecord` 16kHz 连续录音**。解析离线最终识别文本，等待 Rex / 瑞克斯 / 雷克斯唤醒，保持 15 秒后恢复待机；基于 Vosk 语音终点判断命令结束，实时状态会显示在界面。尝试系统噪声抑制；只有识别出语音片段才让粒子产生说话波动。第一回运行从 APK 资源解压中文模型到私有目录。失败清晰报错。
-2. `app/src/main/java/com/rex/remote/MainActivity.java`：删除选择手机系统/离线引擎弹窗，获得麦克风权限后直接启动内置离线引擎。
-3. `app/src/main/java/com/rex/remote/RexView.java`：外层 1940 个红色粒子，内层 1248 个独立粒子；内核尺度固定为外层 1/4，轮廓是不规则颗粒丝线团，不是一个圆球/白光核心。整体提亮。待机时大小为唤醒的 70%，两层各自刚性自转、各层内部相对静止；唤醒后粒子相对运动、不同轨迹、随语音强烈形变。无三道圆环。按键模式唤醒切换保留。
-4. `app/build.gradle`：升为 `0.3.0-offline`，添加 `vosk-android 0.3.75` + JNA，Gradle **构建期间**从 Vosk 官方 HTTPS 下载约 42MB `vosk-model-small-cn-0.22`，校验包含模型文件，并将 ZIP **打包进 APK**。只构建 arm64-v8a，适合你的手机。
-5. `app/src/main/AndroidManifest.xml`：去掉 Android 系统识别服务查询。保持麦克风前台服务声明。
+- sherpa-onnx 的中英双语 Zipformer KWS 和 Silero VAD 保留，还是实时口令第一层。
+- 新增 openWakeWord v0.5.1 的 `melspectrogram.onnx` 与 `embedding_model.onnx` **冻结的预训练神经特征提取器**，在 Android 本机使用 ONNX Runtime 推理。
+- 训练页点击“采集”时，同一口令可录 **6～20** 次，提取深层语音特征；按你的标签更新该口令的轻量个人分类器。推荐从安静近距离开始，逐步加入远距离和轻微背景噪声。
+- **这不是官方 openWakeWord 的重新训练大型神经网络/专用 DNN head**，而是借用它的预训练语音表征完成少样本个人口令分类。没有真实数据和负样本之前，无法保证它一定比 v1.1 更准确；这版属于可实测的工程升级。
+- 为避免训练数据被“老模型新认”，旧 v0.7～v1.1 MFCC 数据原样保留，但 **不能直接用于新神经模型；每条口令需要重新录入，神经特征才能参与**。
+- CAM++ 旧声纹数据保留、声纹页录入功能保留，但正常口令**不再强制用声纹门槛拒绝**。口令相似 ≠ 本人认证，也没有录音重放防护。
+- 语音识别仍然**仅预览，不会自动发运动红外，不控制真实电机**。
 
-其它文件，例如 `RexCommand.java`、`NecIr.java`、`nanopc/` 未改。Android App 没有 `INTERNET` 权限。**模型的下载发生在 GitHub 云端编译时，而不是用户手机上。** 因模型存在，v0.3 APK 会明显大于之前的 33KB（仅模型压缩包约 42MB）。
+## 语音处理
 
-## 现有 GitHub 仓库升级（不用上传 .github）
+`AudioRecord 16kHz` → `Silero VAD + sherpa Zipformer KWS` → 已完成语音片段 → `openWakeWord mel + speech-embedding 模型` → 本机个人分类器（对已采样≥6次的口令评分） → 语义冲突拒绝/低风险强匹配辅助/唤醒确认 → UI 预览。
 
-1. 下载 `REX_Android_v0_3_update_existing_GitHub.zip`，Windows 右键「全部解压」。
-2. 打开你现有的私有 GitHub 仓库。点击 Add file → Upload files。
-3. **把解压后 `app` 文件夹拖进去**，保持其内部路径，检查文件确实被更新到 `app/src/main/...`、`app/build.gradle`；提交更改。
-4. 沿用之前成功的 `.github/workflows/build-apk.yml`，点击 Actions，运行原来的 REx Android 工作流。
-5. **第一次构建要从官网获取约 42MB 模型**。日志里应该出现 `REx: downloading official 42MB offline Chinese model` 和 `REx: offline model bundled successfully`。如果 Gradle 无法下载模型，构建会失败；**不会成功产出一个缺模型的假离线 APK**。
-6. Actions 完成后下载 Artifacts → 解压 → `app-debug.apk`。用手机文件管理器安装；同一签名可覆盖旧版，否则先卸载旧调试版。
-7. 手机上点击「开启监听」，授权麦克风。首次加载和解压模型时界面会提示，之后说 **「瑞克斯」/「雷克斯」/「Rex」**，再说「前进」或「停」检查**文字及粒子反应**。按键模式也能通过唤醒词返回粒子界面。
+正常 KWS 唤醒不再卡声纹；当 **KWS 没命中**而个人神经模型很确定命中唤醒词，需要连续两次有效匹配，且只唤醒界面，不验证身份。强匹配的已训练动作在唤醒后可能补救候选，但最低要求12条该口令样本且已训练其他可比较动作；失能或单字短口令不会由个人神经模型补救。
 
-**这里交付的是可云端编译的完整源码，不是已完成编译的 APK。** 当前本地执行环境没有 Android SDK，无法直接验证 APK 安装/ColorOS 实机表现。若 CI 失败，直接复制首个红色错误日志，不要反复重新上传工程。
+## 训练建议
 
-## 需要坦诚说明的限制
+1. 每条**优先**录 6 次确认功能，推荐增至 12～20 次；尤其先练两三个容易混淆的不同动作，辅助负类比较。
+2. 组合建议：5 次清晰近距离、3 次稍远、2 次正常音量较慢、2 次轻微背景噪声（总计12次）。不要在严重噪声下强行训练。
+3. 采集语音需要由你自己按按钮标注口令。**误录别的词会污染模型**，可以通过“清除本条”单独重训。
+4. 录够12次后，保持机器人运动控制断开，分别测试正常命令、相似词、普通聊天、电视音、短促响声以及远距离说话。
+5. 神经特征只能适应有限的音色、发音和环境差异，不能推断身份，也不能单靠“采集次数多”保证准确率。
 
-- Vosk 这次实现了**不依赖 ColorOS 系统服务的连续本地普通话语音识别**，不是手机 OEM 的超低功耗硬件唤醒服务。首次解压和识别会消耗更多内存/电池。Android 16 要求从前台合法启动麦克风前台服务，系统仍可能中止进程；强制停止 App 后不再监听。
-- Vosk 的声学解码 + 简单能量门控并非 100% 的「人声与非人声分类器」，电视人声、音乐唱词仍有误触发可能。要求更严格时需要专门的 VAD + 声纹 + 防录音回放验证。
-- **本人声纹验证尚未实现**，所以识别出的运动指令**只显示文字，不发射红外**。绝不冒充“只认本人”。按键保持此前 NEC 红外**单次发射联调**逻辑，不能证明 NanoPC 已收到；NanoPC 当前红外接收设备尚未被 Ubuntu 注册，也尚未接 ROS2。
-- 不能依赖单向红外的「停」作为唯一停止机制。正式连接行走必须在机器人侧加入独立可靠的运动停机保护；绝不能直接以这版控制真实机器人。
-- 本地离线中文模型：`vosk-model-small-cn-0.22`，Vosk 官方列出的 Apache 2.0 模型。下载地址：<https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip>。Vosk SDK：<https://github.com/alphacep/vosk-api>。
+## GitHub 安装（最少上传）
 
-## 本地完成的检查
+基于**已经上传并能构建的 v1.1 仓库**：解压 `REX_Android_v1_2_minimal_upload.zip`，保持目录结构上传对应文件（新增/覆盖），然后 `Commit changes`。新版 Action 名称 `REx Android v1.2 personal neural commands APK`。
 
-- `RexCommand` 中文、英文、别名与白名单 Java 测试通过；
-- 核查全部源文件中无 Android `SpeechRecognizer` 运行时调用，且语音 `VoiceService` 不调用 `NecIr.send()`；
-- 核查新粒子结构（1940 外层 + 1248 内层，0.70 待机尺寸，0.25 内核比例）；
-- 由于本地无 Android SDK 和外部模型下载能力，**没有进行 Android APK 构建或手机真机验收**。
+新工作流会自动获取官方 `openWakeWord v0.5.1` 的两个 ONNX 特征模型。**不能只上传 Java 代码而不上传 Gradle、工作流和模型准备脚本。** 原 sherpa 模型仍由之前的脚本准备。完整源码 ZIP 不包含大型 ONNX 模型，需要在 Actions 联网构建。
+
+构建后下载 `REX-v1.2-personal-neural-debug-APK`，从中解压 `app-debug.apk`。先尝试覆盖安装，**不要直接卸载 v1.1**；如 debug 签名变化，卸载将导致已录声纹/个人口令数据丢失。
+
+## 验证/限制
+
+- 已通过 `bash tests/run_offline_tests.sh`：14 项 Java 离线测试（含神经特征分类器保存、滚动采集、近邻拒绝、唤醒两次确认）。
+- 已用模拟 ONNX Runtime Java 接口检查新特征提取类的 Java 编译。
+- 已完成 Python 脚本语法检查。
+- 未能在当前环境完成 **真实 Android Gradle 编译、模型下载及手机麦克风测试**；所以暂时没有可报告的真实识别率、误触发率、延迟和远距离性能。使用 GitHub Actions 第一次构建时可能还需要解决依赖/设备兼容问题。
+- 如果构建失败，优先复制 Actions 第一条失败报错，不必重新上传完整工程。
+
+## 开源参考
+
+- https://github.com/dscripka/openWakeWord （神经特征提取与官方训练资料）
+- https://github.com/msnilsen/openwakeword-android （Android ONNX 参考实现）
+- https://github.com/k2-fsa/sherpa-onnx （原有中英流式 KWS / VAD）
+
+openWakeWord 的官方通用自动训练方案主要面向英文；对 25 个中文及中英混合口令的**完整专用 DNN 模型训练**仍然需要用户带标签的原始音频、困难负样本、噪声增强和电脑端训练/评估，本版没有把那件事冒充已完成。

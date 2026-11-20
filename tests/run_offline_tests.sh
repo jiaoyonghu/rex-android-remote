@@ -9,11 +9,11 @@ export LC_ALL=C.UTF-8
 src_classes=(RexCommand CommandPhrases CommandAcoustics CommandAudioSegmenter
  CommandActivityGate BilingualCommandRouter EnrollmentPrompts SpeakerMath
  SpeakerProfile SpeechActivityGate CommandTemplateStore VoskGrammar SpeechFusion
- SherpaCommandPolicy VoiceIdentityPolicy PersonalWakePolicy)
+ SherpaCommandPolicy VoiceIdentityPolicy PersonalWakePolicy PersonalNeuralStore NeuralWakePolicy)
 test_classes=(CommandActivityGateTest CommandTest CommandAcousticsTest
  CommandTemplateStoreTest EnrollmentTest SpeakerMathTest SpeechGateTest
  SpeechFusionTest SpeakerProfileTest FarFieldAcousticsTest
- SherpaCommandPolicyTest VoiceIdentityPolicyTest PersonalWakePolicyTest)
+ SherpaCommandPolicyTest VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest)
 stubs=(android/content/Context.java android/content/SharedPreferences.java
  android/util/Base64.java org/json/JSONArray.java org/json/JSONException.java)
 missing=()
@@ -29,7 +29,7 @@ for file in "${stubs[@]}"; do
   [[ -f "tests/jvm_stubs/$file" ]] || missing+=("tests/jvm_stubs/$file")
 done
 if (( ${#missing[@]} )); then
-  printf 'REX v1.1: missing %s required test/source files:\n' "${#missing[@]}" >&2
+  printf 'REX v1.2: missing %s required test/source files:\n' "${#missing[@]}" >&2
   printf '  %s\n' "${missing[@]}" >&2
   exit 2
 fi
@@ -50,7 +50,7 @@ for test in CommandActivityGateTest CommandTest EnrollmentTest SpeakerMathTest S
 done
 for test in CommandAcousticsTest CommandTemplateStoreTest SpeechFusionTest \
  SpeakerProfileTest FarFieldAcousticsTest SherpaCommandPolicyTest \
- VoiceIdentityPolicyTest PersonalWakePolicyTest; do
+ VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest; do
   java -cp "$out" "com.rex.remote.$test"
 done
-printf 'REX v1.1: all 13 offline Java regression tests PASSED\n'
+printf 'REX v1.2: all 14 offline Java regression tests PASSED\n'

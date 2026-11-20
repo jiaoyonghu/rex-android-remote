@@ -169,7 +169,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
     }
     @Override public void onClearCommandPhrase(int index){
         new AlertDialog.Builder(this).setTitle("清除这条口令的训练样本？")
-            .setMessage("将删除『"+CommandPhrases.at(index)+"』的所有本地声学模板，不影响其他口令。")
+            .setMessage("将删除『"+CommandPhrases.at(index)+"』的神经训练样本，不影响其他口令。")
             .setNegativeButton("取消",null)
             .setPositiveButton("清除",(d,w)->sendTrainingAction(VoiceService.ACTION_TRAIN_CLEAR,index,false))
             .show();
