@@ -60,7 +60,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
         stream=kws.createStream();
         SileroVadModelConfig s=SileroVadModelConfig.builder()
             .setModel(new File(folder,"silero_vad.onnx").getAbsolutePath())
-            .setThreshold(0.52f).setMinSpeechDuration(0.18f)
+            .setThreshold(0.45f).setMinSpeechDuration(0.18f)
             .setMinSilenceDuration(0.22f).setMaxSpeechDuration(5f)
             .setWindowSize(512).build();
         VadModelConfig v=VadModelConfig.builder()
