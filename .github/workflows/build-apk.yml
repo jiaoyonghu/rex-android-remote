@@ -1,4 +1,4 @@
-name: REx Android v1.2 personal neural commands APK
+name: REx Android v1.3 weighted keyword fusion APK
 on:
   workflow_dispatch:
   push:
@@ -36,7 +36,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check "pypinyin==0.55.0"
           python tools/prepare_sherpa_android.py
-      - name: Download openWakeWord frozen ONNX feature models
+      - name: Download openWakeWord frozen TFLite feature models
         shell: bash
         run: python tools/prepare_openwakeword_features.py
       - name: Offline speech regression tests
@@ -46,6 +46,6 @@ jobs:
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: REX-v1.2-personal-neural-debug-APK
+          name: REX-v1.3-weighted-fusion-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
