@@ -35,6 +35,23 @@ public final class CommandFusionTest {
                 "changed weighted threshold affects result");
         check(CommandFusion.evaluate("前进",true,false,match(6,.99f,true),strict).pass,
                 "saved weight decision correct");
+        // Mode 1: a valid personal score below the UI threshold still contributes.
+        CommandFusion.Config continuous=new CommandFusion.Config(
+            .44f,.56f,.92f,.42f,CommandFusion.Config.MODE_CONTINUOUS);
+        check(CommandFusion.evaluate("",false,false,match(1,.84f,true),continuous).wake,
+                "mode1 below user gate still weighted for trained wake");
+        check(!CommandFusion.evaluate("",false,false,match(1,.84f,true),c).pass,
+                "mode2 below gate stays zero");
+        check(!CommandFusion.evaluate("",false,false,match(1,.98f,false),continuous).pass,
+                "mode1 must not bypass internal personal safety gate");
+        check(!CommandFusion.evaluate("前进",true,false,match(10,.86f,true),continuous).pass,
+                "mode1 detects low score but valid conflicting command");
+        check(CommandFusion.Config.decode(continuous.encode()).neuralMode==
+                CommandFusion.Config.MODE_CONTINUOUS,"mode1 persists");
+        check(CommandFusion.Config.decode("0.4400,0.5600,0.9200,0.4200").neuralMode==
+                CommandFusion.Config.MODE_ZERO_BELOW,"old four-field preference remains mode2");
+        check(CommandFusion.Config.decode("0.44,0.56,0.92,0.42,3").neuralMode==
+                CommandFusion.Config.MODE_ZERO_BELOW,"invalid mode rejects");
         System.out.println("PASS weighted fusion scoring, mismatches, safety, defaults, persistence parse");
     }
 }

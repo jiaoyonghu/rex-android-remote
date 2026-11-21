@@ -212,7 +212,7 @@ public final class RexView extends View {
         if(control==1){n=t;k=1f-t;}
         if(control==2)ng=.5f+.5f*t;
         if(control==3)total=t;
-        tuningDraft=new CommandFusion.Config(k,n,ng,total);
+        tuningDraft=new CommandFusion.Config(k,n,ng,total,tuningDraft.neuralMode);
         invalidate();
     }
     private void drawSettingSlider(Canvas c,int top,String name,float value,float min,float max,
@@ -235,13 +235,20 @@ public final class RexView extends View {
         drawSettingSlider(c,295,"openWakeWord 权重",tuningDraft.neuralWeight,0f,1f,
             "双权重合计100%，调整一项自动调整另一项");
         drawSettingSlider(c,382,"神经相似度门槛",tuningDraft.neuralThreshold,.5f,1f,
-            "低于门槛记0；默认 0.92（未经实机校准）");
+            tuningDraft.neuralMode==CommandFusion.Config.MODE_CONTINUOUS?
+                "连续模式保留原得分；此门槛只用于模式2":
+                "模式2低于门槛记0；默认 0.92（未经校准）");
         drawSettingSlider(c,469,"最终综合得分门槛",tuningDraft.totalThreshold,0f,1f,
             "得分高于门槛才确认；VAD 必须先通过");
         box(c,20,560,340,639,0xAA261C2D,11);
-        text(c,"计算：KWS×权重 + 个人有效分×权重",31,581,10,0xFFECC3D2,true);
-        text(c,"CAM++ 仅用于声纹录入，不参与日常加权",31,600,9,0xFFC9A7B8,false);
-        text(c,"冲突拒绝 · 单字风险保护 · 不自动发射红外",31,620,9,0xFFFFB3C6,false);
+        text(c,"个人神经门槛处理模式（点击切换）",30,575,10,0xFFECC3D2,true);
+        boolean continuous=tuningDraft.neuralMode==CommandFusion.Config.MODE_CONTINUOUS;
+        box(c,30,582,175,615,continuous?0xC5743857:0x85502B41,8);
+        center(c,"模式1：连续加权",102,602,11,continuous?0xFFFFFFFF:0xFFE6C0D0,true);
+        box(c,185,582,330,615,!continuous?0xC5743857:0x85502B41,8);
+        center(c,"模式2：低于归零",257,602,11,!continuous?0xFFFFFFFF:0xFFE6C0D0,true);
+        text(c,continuous?"仍需个人模型有效、无冲突；CAM++ 不参与评分":
+            "低于门槛记0；冲突拒绝；不自动发射红外",30,632,9,0xFFC9A7B8,false);
         box(c,20,650,170,697,0xAF3B2539,11);
         center(c,"取消修改",95,678,13,0xFFE4B5C9,true);
         box(c,190,650,340,697,0xC35F2B48,11);
@@ -742,6 +749,14 @@ public final class RexView extends View {
             }
             if(page==PAGE_TUNE){
                 if(tuningDrag>=0){updateTuning(x,tuningDrag);tuningDrag=-1;return true;}
+                if(y>=582 && y<=615 && x>=30 && x<=330){
+                    CommandFusion.Config d=tuningDraft;
+                    int mode=x<180?CommandFusion.Config.MODE_CONTINUOUS:
+                        CommandFusion.Config.MODE_ZERO_BELOW;
+                    tuningDraft=new CommandFusion.Config(d.kwsWeight,d.neuralWeight,
+                        d.neuralThreshold,d.totalThreshold,mode);
+                    invalidate();return true;
+                }
                 if(y>=650 && y<=699){
                     if(x<180)discardTuning();
                     else if(actions.onSaveFusionSettings(tuningDraft)){
