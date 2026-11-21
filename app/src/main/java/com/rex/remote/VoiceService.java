@@ -25,9 +25,12 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * REx v1.2: KWS + Silero VAD + openWakeWord deep personal command classifier,
+ * REx v1.4: KWS + VAD + frozen openWakeWord features + trained personal MLP head,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
@@ -102,6 +105,11 @@ public final class VoiceService extends Service {
     private SpeakerProfile profile;
     private CommandTemplateStore templates; // old MFCC data retained
     private PersonalNeuralStore neural;
+    private PersonalWakeHead trainedHead;
+    private final ExecutorService trainingWorker=Executors.newSingleThreadExecutor(r->{
+        Thread t=new Thread(r,"rex-v14-train-head");t.setPriority(Thread.MIN_PRIORITY);return t;
+    });
+    private final AtomicLong trainingRevision=new AtomicLong();
     private volatile boolean trainingMode,trainingArmed;
     private volatile int trainingPhrase;
     private volatile int trainingCount;
@@ -123,6 +131,7 @@ public final class VoiceService extends Service {
 
     @Override public void onCreate(){super.onCreate();profile=new SpeakerProfile(this);templates=new CommandTemplateStore(this);
         neural=new PersonalNeuralStore(this);
+        trainedHead=new PersonalWakeHead(this,neural);
         if(profile.hasProfile())ownerStatus="CAM++ 声纹已录入 · 仅供声纹页参考，不强制限制指令";
         else if(getSharedPreferences("rex_owner_voice_private_v1",MODE_PRIVATE)
                 .contains("owner_embedding"))
@@ -142,11 +151,11 @@ public final class VoiceService extends Service {
         if(ACTION_TRAIN_BEGIN.equals(action)||ACTION_TRAIN_SELECT.equals(action)){
             trainingMode=true;trainingArmed=false;
             commandClips.clear();captureGeneration++;neuralWake.clear();
-            trainingPhrase=Math.max(0,Math.min(CommandPhrases.count()-1,requestedPhrase));
+            trainingPhrase=Math.max(0,Math.min(PersonalNeuralStore.NON_COMMAND,requestedPhrase));
             trainingCount=neural.count(trainingPhrase);
-            trainingInfo="『"+CommandPhrases.at(trainingPhrase)+"』已录 "
-                +trainingCount+" / 20 次 · 至少6次启用，建议12次，满20次滚动替换";
-            status="openWakeWord 神经特征训练 · 只在本机保存特征，不存原始录音";
+            trainingInfo="『"+trainingLabel(trainingPhrase)+"』已录 "
+                +trainingCount+" / 30 次 · 分类器需本词6条与其他/非口令6条";
+            status="openWakeWord 个人神经分类器训练 · 原始录音不落盘";
             publishTraining("TRAIN_SELECTED");
         }
         if(ACTION_TRAIN_CAPTURE.equals(action)){
@@ -156,7 +165,7 @@ public final class VoiceService extends Service {
             }else{
                 trainingArmed=true;captureGeneration++;
                 trainingDeadline=SystemClock.elapsedRealtime()+12000;
-                trainingInfo="正在采集『"+CommandPhrases.at(trainingPhrase)+"』，请说一次并停顿";
+                trainingInfo="正在采集『"+trainingLabel(trainingPhrase)+"』，请说一次并停顿";
                 publishTraining("TRAIN_LISTEN");
             }
             return START_NOT_STICKY;
@@ -164,6 +173,12 @@ public final class VoiceService extends Service {
         if(ACTION_TRAIN_CLEAR.equals(action)){
             if(trainingMode && requestedPhrase==trainingPhrase){
                 neural.clear(trainingPhrase);trainingCount=0;trainingArmed=false;
+                trainingRevision.incrementAndGet();
+                // Every one-vs-rest head could have used this phrase as negative.
+                // On deletion invalidate all learned heads, then rebuild from
+                // the remaining samples rather than retaining removed evidence.
+                for(int p=0;p<CommandPhrases.count();p++)trainedHead.forget(p);
+                scheduleHeadTraining(PersonalNeuralStore.NON_COMMAND);
                 trainingInfo="本条已清空，请点击『采集』重新朗读";
                 publishTraining("TRAIN_CLEARED");
             }
@@ -276,13 +291,41 @@ public final class VoiceService extends Service {
             pcm=audio;this.phrase=phrase;this.generation=generation;
         }
     }
+    private static String trainingLabel(int index){
+        return index==PersonalNeuralStore.NON_COMMAND?"非口令/相似词（负样本）":CommandPhrases.at(index);
+    }
+    /** Re-learn weights off the realtime audio thread; newest training revision wins. */
+    private void scheduleHeadTraining(int changed){
+        final long revision=trainingRevision.incrementAndGet();
+        trainingWorker.execute(()->{
+            if(trainingRevision.get()!=revision)return;
+            String outcome="";
+            if(changed==PersonalNeuralStore.NON_COMMAND){
+                int ready=0;
+                for(int p=0;p<CommandPhrases.count();p++){
+                    if(trainingRevision.get()!=revision)return;
+                    if(neural.count(p)>=PersonalWakeHead.MIN_POS){
+                        String msg=trainedHead.train(p,()->trainingRevision.get()==revision);
+                        if(msg.startsWith("训练成功"))ready++;
+                    }
+                }
+                outcome="负样本更新；已训练 "+ready+" 个分类头";
+            }else outcome=trainedHead.train(changed,()->trainingRevision.get()==revision);
+            if(trainingRevision.get()!=revision)return;
+            diagnostics.onPersonal("v1.4 真分类头 · "+outcome);
+            if(trainingMode && changed==trainingPhrase){
+                trainingInfo=outcome+" · 已存 "+neural.count(changed)+"/30";
+                publishTraining("TRAIN_MODEL");
+            }
+        });
+    }
     private void handleTrainingClip(CommandClip clip,OpenWakeWordFeatures features){
         if(!trainingMode || clip.phrase!=trainingPhrase ||
            clip.generation!=captureGeneration)return;
         // Exact-transcript gating rejected the owner's accent. A
-        // supervised recording button supplies the label; use actual audio
-        // quality and within-phrase consistency checks instead. It is NOT
-        // subsequently allowed to trigger an action without KWS evidence.
+        // The chosen phrase supplies the positive/negative supervised label.
+        // The learned head may later complement missing KWS evidence, but all
+        // outcomes still require the VAD segment and fusion policy.
         long measureStarted=SystemClock.elapsedRealtime();
         float[] vector=features==null?null:features.embed(clip.pcm);
         String failure=features==null?
@@ -295,14 +338,15 @@ public final class VoiceService extends Service {
         }
         else {
             int n=neural.count(clip.phrase);trainingCount=n;
-            diagnostics.onPersonal("训练成功："+CommandPhrases.at(clip.phrase)+" · "+n+" 条样本");
+            diagnostics.onPersonal("训练样本保存："+trainingLabel(clip.phrase)+" · "+n+" 条样本");
             diagnostics.onVerdict("训练已保存","个人特征写入本机",
                 SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-measureStarted);
-            trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』已采集 "+n+
-                "/20"+(n>=PersonalNeuralStore.MIN_TAKES?
-                " · 个人神经模型已参与识别，建议录至12次":
+            trainingInfo="『"+trainingLabel(clip.phrase)+"』已采集 "+n+
+                "/30"+(n>=PersonalNeuralStore.MIN_TAKES?
+                " · 已保存，后台更新神经分类器（至少6条负样本）":
                 " · 还需 "+(PersonalNeuralStore.MIN_TAKES-n)+" 次");
             publishTraining("TRAIN_OK");
+            scheduleHeadTraining(clip.phrase);
         }
     }
     private File unpackSherpaModel() throws Exception {
@@ -383,17 +427,35 @@ public final class VoiceService extends Service {
             if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES){trained=true;break;}
         }
         long personalStarted=SystemClock.elapsedRealtime();
-        PersonalNeuralStore.Result match=trained && features!=null?
-            neural.evaluate(features.embed(clip.pcm)):null;
+        float[] utteranceFeature=trained && features!=null?features.embed(clip.pcm):null;
+        PersonalNeuralStore.Result oldMatch=utteranceFeature==null?null:neural.evaluate(utteranceFeature);
+        PersonalWakeHead.Result headMatch=utteranceFeature==null?null:trainedHead.evaluate(utteranceFeature);
+        PersonalNeuralStore.Result match=oldMatch;
+        // Trained head takes precedence only when it has genuinely learned
+        // positive-vs-negative discrimination. The old classifier is fallback.
+        if(headMatch!=null && headMatch.accepted &&
+           (oldMatch==null || !oldMatch.accepted ||
+            headMatch.phrase==oldMatch.phrase ||
+            (headMatch.score>=.95f && headMatch.second<=.35f))){
+            match=new PersonalNeuralStore.Result(headMatch.phrase,headMatch.runnerUp,
+                headMatch.score,headMatch.second,.64f,headMatch.trainedCount,true,
+                "v1.4 监督训练 MLP 分类头（非声纹认证）");
+        }
+        if(headMatch!=null){
+            diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
+                "v1.4分类头 p=%d 得分 %.3f 备选 %.3f · %s · %s",
+                headMatch.phrase,headMatch.score,headMatch.second,
+                headMatch.reason,match==oldMatch?"沿用原匹配":"采用训练分类头"));
+        }
         CommandFusion.Config cfg=CommandFusion.load(this);
         if(match==null){
             diagnostics.onPersonal(!trained?"未启用：没有达到6条的个人训练口令":
                 features==null?"不可用：个人TFLite模型未加载":"个人语音没有可用的模型得分");
         }else{
             diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
-                "个人得分 %.3f / 可调门槛 %.3f / 原样本门槛 %.3f · %d条 · %dms",
+                "个人得分 %.3f / 可调门槛 %.3f / 内部门槛 %.3f · %d条 · %dms (%s)",
                 match.score,cfg.neuralThreshold,match.threshold,match.samples,
-                SystemClock.elapsedRealtime()-personalStarted));
+                SystemClock.elapsedRealtime()-personalStarted,match.reason));
         }
         // The stock sherpa JNI does not expose a continuous KWS probability.
         // Its evidence is exactly 1 for a hit and 0 for no hit, NOT a confidence.
@@ -408,20 +470,6 @@ public final class VoiceService extends Service {
             publish(null,null,null,false,0f);
             return;
         }
-        // Only the single-syllable personal-only 'Rex' wake is double-confirmed.
-        // Longer well-trained wake phrases can win by the weighted score once.
-        /*
-        if(decision.wake && decision.kwsEvidence==0f && match!=null &&
-           "rex".equals(RexCommand.norm(CommandPhrases.at(match.phrase)))){
-            if(!neuralWake.accept(match.phrase,now)){
-                status="个人短唤醒已强匹配，请4秒内再说一次";
-                diagnostics.onVerdict("等待短唤醒复核",decision.report(cfg),
-                    SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
-                publish(null,null,null,false,0f);
-                return;
-            }
-        }
-        */
         if(decision.wake)neuralWake.clear();
         RexCommand command=decision.command;
         boolean wake=decision.wake;
@@ -677,6 +725,8 @@ public final class VoiceService extends Service {
         AudioRecord mic=recording;
         if(mic!=null)try{mic.stop();}catch(Exception ignored){}
         if(worker!=null)worker.interrupt();
+        trainingRevision.incrementAndGet();
+        trainingWorker.shutdownNow();
         if(profile!=null)profile.abandon();
         super.onDestroy();
     }

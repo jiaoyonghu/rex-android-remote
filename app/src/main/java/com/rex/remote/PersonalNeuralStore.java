@@ -12,6 +12,7 @@ import java.util.*;
  */
 public final class PersonalNeuralStore {
     public static final int MIN_TAKES=6, RECOMMENDED_TAKES=12, MAX_TAKES=30;
+    public static final int NON_COMMAND=CommandPhrases.count();
     private static final int MAGIC=0x52584E32, VERSION=1;
     private static final int DIM=OpenWakeWordFeatures.DIM;
     private final File directory;
@@ -51,7 +52,13 @@ public final class PersonalNeuralStore {
         }
         cache.put(phrase,clips);return clips;
     }
-    private static boolean valid(int phrase){return phrase>=0&&phrase<CommandPhrases.count();}
+    private static boolean valid(int phrase){return phrase>=0&&phrase<=NON_COMMAND;}
+    /** Defensive copies for the supervised classifier; includes optional NON_COMMAND data. */
+    public synchronized List<float[]> samples(int phrase){
+        List<float[]> result=new ArrayList<>();
+        if(valid(phrase))for(float[] v:load(phrase))result.add(v.clone());
+        return result;
+    }
     public synchronized int count(int phrase){return valid(phrase)?load(phrase).size():0;}
     public synchronized boolean clear(int phrase){
         if(!valid(phrase))return false;

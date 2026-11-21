@@ -63,12 +63,12 @@ public final class RexView extends View {
     private int outgoingPage=-1;
     private int trainIndex,trainCount;
     private boolean trainCapturing;
-    private String trainInfo="点击采集，为这条固定指令录音至少6次，建议12至30次";
+    private String trainInfo="目标口令至少6次，最后一项非口令也至少6次，再后台训练";
     private int enrollStep;
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v1.3 · 口令融合调参 · 语音红外未授权";
+    private String message="v1.4 · 个人口令神经训练 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -260,7 +260,7 @@ public final class RexView extends View {
     public void setIrStatus(String value){irStatus=value;invalidate();}
     public void setMessage(String value){message=value;invalidate();}
     public void onTraining(int index,int count,String info,String event){
-        trainIndex=Math.max(0,Math.min(CommandPhrases.count()-1,index));
+        trainIndex=Math.max(0,Math.min(PersonalNeuralStore.NON_COMMAND,index));
         trainCount=count;
         if(info!=null)trainInfo=info;
         if("TRAIN_LISTEN".equals(event))trainCapturing=true;
@@ -627,13 +627,15 @@ public final class RexView extends View {
         box(c,238,656,340,699,0xAD502842,10);
         center(c,"返回智能体",289,682,10,0xFFFFD4E1,true);
     }
+    private static String trainLabel(int i){return i==PersonalNeuralStore.NON_COMMAND?
+        "非口令 / 相似词":CommandPhrases.at(i);}
     private void drawCommandTraining(Canvas c){
         center(c,"个性化口令训练 / COMMAND TRAINING",180,187,15,0xFFFFC6D7,true);
-        center(c,"openWakeWord 深层语音特征 · 个人分类器持续训练",180,211,9,0xFFCDA8B9,false);
+        center(c,"openWakeWord 特征 + 监督训练神经分类器",180,211,9,0xFFCDA8B9,false);
         box(c,20,231,340,300,0xAD2C1C2C,12);
-        center(c,"第 "+(trainIndex+1)+" / "+CommandPhrases.count()+" 条口令",180,250,10,0xFFC9AAB7,false);
-        center(c,CommandPhrases.at(trainIndex),180,276,
-            CommandPhrases.at(trainIndex).length()>9?16:22,0xFFFFD9E6,true);
+        center(c,"第 "+(trainIndex+1)+" / "+(CommandPhrases.count()+1)+" 条训练项",180,250,10,0xFFC9AAB7,false);
+        center(c,trainLabel(trainIndex),180,276,
+            trainLabel(trainIndex).length()>9?16:22,0xFFFFD9E6,true);
         box(c,20,310,172,361,0xA6382335,10);
         center(c,"← 上一条",96,343,13,0xFFFFCDDC,true);
         box(c,188,310,340,361,0xA6382335,10);
@@ -653,11 +655,11 @@ public final class RexView extends View {
         text(c,shortText(trainInfo,42),28,641,10,0xFFFFCBDA,false);
         text(c,shortText(voiceStatus,42),28,658,9,0xFFC8A5B2,false);
         text(c,"拒绝相似口令的模糊猜测 · 未授权发射语音红外",28,675,9,0xFFD9AFC1,false);
-        text(c,"每次只念一条；失败可以重采；录过的样本保存在本机",28,690,8,0xFFAC8796,false);
+        text(c,"末项可录非口令作为负样本；模型在后台训练",28,690,8,0xFFAC8796,false);
     }
     public void openCommandTraining(){
         changePage(PAGE_TRAIN);trainIndex=0;trainCount=0;trainCapturing=false;
-        trainInfo="请选择口令，点击采集并朗读；至少录 3 次";
+        trainInfo="先录目标口令至少6次，再录末项非口令至少6次";
         invalidate();
     }
     public void openEnrollment(){
@@ -822,7 +824,7 @@ public final class RexView extends View {
             boolean longPress=now-downMs>1100;
             if(page==PAGE_TRAIN){
                 if(y>=310 && y<=361){
-                    trainIndex=Math.max(0,Math.min(CommandPhrases.count()-1,
+                    trainIndex=Math.max(0,Math.min(PersonalNeuralStore.NON_COMMAND,
                         trainIndex+(x<180?-1:1)));
                     trainCount=0;trainCapturing=false;
                     actions.onSelectCommandPhrase(trainIndex);invalidate();return true;
