@@ -410,6 +410,7 @@ public final class VoiceService extends Service {
         }
         // Only the single-syllable personal-only 'Rex' wake is double-confirmed.
         // Longer well-trained wake phrases can win by the weighted score once.
+        /*
         if(decision.wake && decision.kwsEvidence==0f && match!=null &&
            "rex".equals(RexCommand.norm(CommandPhrases.at(match.phrase)))){
             if(!neuralWake.accept(match.phrase,now)){
@@ -420,6 +421,7 @@ public final class VoiceService extends Service {
                 return;
             }
         }
+        */
         if(decision.wake)neuralWake.clear();
         RexCommand command=decision.command;
         boolean wake=decision.wake;
