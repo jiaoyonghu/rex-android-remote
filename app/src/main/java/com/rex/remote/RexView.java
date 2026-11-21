@@ -63,7 +63,7 @@ public final class RexView extends View {
     private int outgoingPage=-1;
     private int trainIndex,trainCount;
     private boolean trainCapturing;
-    private String trainInfo="点击采集，为这条固定指令录音至少6次，建议12至20次";
+    private String trainInfo="点击采集，为这条固定指令录音至少6次，建议12至30次";
     private int enrollStep;
     private boolean enrollReady;
     private boolean enrollmentDone;
@@ -631,7 +631,7 @@ public final class RexView extends View {
         center(c,"← 上一条",96,343,13,0xFFFFCDDC,true);
         box(c,188,310,340,361,0xA6382335,10);
         center(c,"下一条 →",264,343,13,0xFFFFCDDC,true);
-        center(c,"已采集 "+trainCount+" / 20 次 · 可重复采集",180,385,10,
+        center(c,"已采集 "+trainCount+" / 30 次 · 可重复采集",180,385,10,
             trainCount>=PersonalNeuralStore.MIN_TAKES?0xFFFFBED0:0xFFB6A2AF,false);
         box(c,20,400,340,451,0xBB5A2842,12);
         center(c,trainCapturing?"正在采集 · 请朗读后停顿":
