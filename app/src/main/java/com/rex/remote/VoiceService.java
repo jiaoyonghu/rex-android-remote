@@ -357,6 +357,9 @@ public final class VoiceService extends Service {
         final short[] samples;final long generation;
         AudioFrame(short[] samples,long generation){this.samples=samples;this.generation=generation;}
     }
+    /** VAD already delivered a real speech segment. Zipformer has been running
+     * concurrently for low latency; neither a background KWS hit nor a loud
+     * noise by itself can bypass this final speech-segment gate. */
     private void recognizeSherpaClip(SherpaVoiceEngine.Clip clip,long generation,
                                       SherpaVoiceEngine engine,OpenWakeWordFeatures features){
         if(generation!=captureGeneration)return;
@@ -375,16 +378,6 @@ public final class VoiceService extends Service {
         }
         long now=SystemClock.elapsedRealtime();
         long decisionStarted=now;
-        String keyword=clip.keyword;
-        SherpaCommandPolicy.Decision kws=SherpaCommandPolicy.decide(
-            keyword,awake,null,clip.conflictingKeywords);
-        if(clip.conflictingKeywords){
-            neuralWake.clear();
-            diagnostics.onPersonal("未执行：KWS候选互相冲突");
-            diagnostics.onVerdict("拒绝输出","同段语音存在不同关键词冲突",
-                SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
-            return;
-        }
         boolean trained=false;
         for(int i=0;i<CommandPhrases.count();i++){
             if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES){trained=true;break;}
@@ -392,85 +385,65 @@ public final class VoiceService extends Service {
         long personalStarted=SystemClock.elapsedRealtime();
         PersonalNeuralStore.Result match=trained && features!=null?
             neural.evaluate(features.embed(clip.pcm)):null;
+        CommandFusion.Config cfg=CommandFusion.load(this);
         if(match==null){
-            diagnostics.onPersonal(!trained?"未启用：没有达到6条的训练口令":
-                features==null?"不可用：个人TFLite模型未加载":"没有有效的个人匹配结果");
+            diagnostics.onPersonal(!trained?"未启用：没有达到6条的个人训练口令":
+                features==null?"不可用：个人TFLite模型未加载":"个人语音没有可用的模型得分");
         }else{
             diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
-                "%s · %.3f / 门槛 %.3f · %d条样本 · %dms",
-                match.accepted?"个人匹配通过":"个人匹配未通过",
-                match.score,match.threshold,match.samples,
+                "个人得分 %.3f / 可调门槛 %.3f / 原样本门槛 %.3f · %d条 · %dms",
+                match.score,cfg.neuralThreshold,match.threshold,match.samples,
                 SystemClock.elapsedRealtime()-personalStarted));
         }
-        RexCommand command=kws.command;
-        boolean wake=kws.wake;
-        String explanation=kws.reason;
-        if(match!=null && match.accepted){
-            RexCommand learned=CommandPhrases.command(match.phrase);
-            if(command!=null && learned!=null && learned!=command &&
-               match.score>=match.threshold+.03f){
-                command=null;wake=false;
-                explanation="神经模型与 KWS 指向不同动作，已拒绝";
-            }else if(!wake && command==null && learned==RexCommand.WAKE && !awake &&
-                match.score>=match.threshold+.07f){
-                if(neuralWake.accept(match.phrase,now)){
-                    wake=true;explanation="个人神经唤醒两次强匹配 · 非身份认证";
-                }else{
-                    status="个人神经唤醒第1次匹配，请在4秒内再说一次";
-                    diagnostics.onVerdict("等待第二次唤醒","首次个人唤醒强匹配，需要4秒内再次确认",
-                        SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
-                    publish("个人神经唤醒待确认",null,null,false,0f);
-                    return;
-                }
-            }else if(!wake && command==null && awake && learned!=null &&
-                    learned!=RexCommand.WAKE && learned!=RexCommand.DISABLE &&
-                    match.samples>=PersonalNeuralStore.RECOMMENDED_TAKES &&
-                    match.score>=match.threshold+.09f &&
-                    match.runnerUp>=0 && match.score-match.second>=.12f){
-                // Strong personalised rescue is PREVIEW ONLY, not IR or motors.
-                String trainedPhrase=CommandPhrases.at(match.phrase);
-                if(!"退".equals(trainedPhrase) && !"停".equals(trainedPhrase)){
-                    command=learned;
-                    explanation="个人神经关键词强匹配 · 仅预览";
-                }
-            }else if(command!=null && learned==command){
-                explanation="KWS + openWakeWord 神经个性化一致";
-            }
-        }else if(!keyword.isEmpty())neuralWake.clear();
-        if(!wake && command==null){
-            diagnostics.onVerdict("未输出",keyword.isEmpty()?
-                "VAD已检测到语音，但KWS未命中；个人模型也未满足补救条件":
-                "候选未通过："+explanation,
+        // The stock sherpa JNI does not expose a continuous KWS probability.
+        // Its evidence is exactly 1 for a hit and 0 for no hit, NOT a confidence.
+        CommandFusion.Decision decision=CommandFusion.evaluate(
+            clip.keyword,awake,clip.conflictingKeywords,match,cfg);
+        diagnostics.onPersonal(decision.report(cfg));
+        if(!decision.pass){
+            if(!clip.keyword.isEmpty())neuralWake.clear();
+            diagnostics.onVerdict("融合拒绝",decision.report(cfg),
                 SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
-            if(!keyword.isEmpty()){
-                status="未输出口令 · "+explanation;
-                publish("关键词: "+keyword,null,null,false,0f);
-            }
+            status="本句未通过综合评分 · "+decision.reason;
+            publish(null,null,null,false,0f);
             return;
         }
-        if(wake)neuralWake.clear();
-        String signature=String.valueOf(command)+"|"+wake+"|"+keyword;
+        // Only the single-syllable personal-only 'Rex' wake is double-confirmed.
+        // Longer well-trained wake phrases can win by the weighted score once.
+        if(decision.wake && decision.kwsEvidence==0f && match!=null &&
+           "rex".equals(RexCommand.norm(CommandPhrases.at(match.phrase)))){
+            if(!neuralWake.accept(match.phrase,now)){
+                status="个人短唤醒已强匹配，请4秒内再说一次";
+                diagnostics.onVerdict("等待短唤醒复核",decision.report(cfg),
+                    SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
+                publish(null,null,null,false,0f);
+                return;
+            }
+        }
+        if(decision.wake)neuralWake.clear();
+        RexCommand command=decision.command;
+        boolean wake=decision.wake;
+        String signature=String.valueOf(command)+"|"+wake+"|"+clip.keyword;
         if(signature.equals(lastFinalSignature)&&now-lastFinalMs<750){
             diagnostics.onVerdict("重复结果已抑制","750ms内相同候选被去重",
                 SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
             return;
         }
         lastFinalSignature=signature;lastFinalMs=now;
-        if(wake || (command!=null && RexCommand.stripWakePrefix(keyword)!=null &&
-                   !RexCommand.stripWakePrefix(keyword).isEmpty()))awake=true;
+        if(wake)awake=true;
         if(command==RexCommand.SLEEP){awake=false;lastOwnerVerifiedMs=0;}
-        ownerStatus="个人口令神经模型（非身份认证） · CAM++ 仅在声纹页录入";
-        if(wake)status="REx 已唤醒 · "+explanation;
+        ownerStatus="个人神经模型辅助口令（非本人认证）· CAM++ 仅在声纹页";
+        if(wake)status="REx 已唤醒 · 综合得分 " +
+            String.format(java.util.Locale.ROOT,"%.3f",decision.combined);
         else if(command==RexCommand.SLEEP)status="已睡眠";
-        else status="识别『"+command.label+"』· "+explanation+
-            " · 仅预览，不发送运动红外";
+        else status="识别『"+command.label+"』· 综合得分 "+
+            String.format(java.util.Locale.ROOT,"%.3f",decision.combined)+
+            " · 仅预览，不发送红外";
         diagnostics.onVerdict(wake?"唤醒成功":command==RexCommand.SLEEP?
                 "进入待机":"识别成功："+command.label,
-            explanation,SystemClock.elapsedRealtime(),
+            decision.report(cfg),SystemClock.elapsedRealtime(),
             SystemClock.elapsedRealtime()-decisionStarted);
-        publish("关键词: "+keyword+(match!=null?" | 神经得分 " +
-                String.format(java.util.Locale.ROOT,"%.2f",match.score):""),
-            null,command,wake,0f);
+        publish(decision.report(cfg),null,command,wake,0f);
     }
     private void recognitionLoop(){
         try{

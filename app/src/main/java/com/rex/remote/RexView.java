@@ -38,6 +38,7 @@ public final class RexView extends View {
         void onFinishCommandTraining();
         void onResetDiagnostics();
         void onCopyDiagnostics(String report);
+        default boolean onSaveFusionSettings(CommandFusion.Config settings){return false;}
     }
     private static final int W=360,H=780;
     private final Actions actions;
@@ -50,7 +51,7 @@ public final class RexView extends View {
     private final float[] corePx=new float[1248];
     private final float[] corePy=new float[1248];
     private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2,PAGE_TRAIN=3,
-        PAGE_DIAG=4;
+        PAGE_DIAG=4,PAGE_TUNE=5;
     // Voice-page-only transition: native particle positions <-> stable,
     // screen-wide scattering positions. All other page changes remain instant.
     private static final long PARTICLE_TRANSITION_MS=720;
@@ -67,7 +68,7 @@ public final class RexView extends View {
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v1.2.3 · 语音诊断 · 语音红外未授权";
+    private String message="v1.3 · 口令融合调参 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -83,6 +84,9 @@ public final class RexView extends View {
     private long lastRightTapMs;
     private int leftTaps,rightTaps;
     private int diagnosticTaps;
+    private int tuningTaps,tuningDrag=-1;
+    private long lastTuningTapMs;
+    private CommandFusion.Config tuningDraft;
     private long lastDiagnosticTapMs;
     private String diagEngine="未启动",diagKws="未捕获关键词",diagVad="尚无完整语音片段",
         diagPersonal="未评估",diagVerdict="尚无最终裁决",
@@ -162,6 +166,7 @@ public final class RexView extends View {
         add(143,520,217,578,"转个圈","随机",RexCommand.TURN_AROUND);
         add(20,585,172,639,"激活","ACTIVE",RexCommand.ACTIVE);
         add(188,585,340,639,"失能 · 高风险","二次确认",RexCommand.DISABLE);
+        tuningDraft=CommandFusion.load(context);
         setLayerType(View.LAYER_TYPE_HARDWARE,null);
     }
     private static void initScatter(Random random,float[] xs,float[] ys){
@@ -187,6 +192,60 @@ public final class RexView extends View {
         }else{particleTransition=false;outgoingPage=-1;}
         page=target;
         invalidate();
+    }
+    private void openTuning(){
+        // Reload only the SAVED values. Unsaved edits never reach VoiceService.
+        tuningDraft=CommandFusion.load(getContext());
+        changePage(PAGE_TUNE);
+    }
+    private void discardTuning(){
+        tuningDraft=CommandFusion.load(getContext());tuningDrag=-1;
+        changePage(PAGE_VOICE);
+    }
+    private void updateTuning(float x,int control){
+        if(tuningDraft==null)tuningDraft=CommandFusion.defaults();
+        float t=Math.max(0f,Math.min(1f,(x-36f)/288f));
+        t=Math.round(t*100f)/100f;
+        float k=tuningDraft.kwsWeight,n=tuningDraft.neuralWeight;
+        float ng=tuningDraft.neuralThreshold,total=tuningDraft.totalThreshold;
+        if(control==0){k=t;n=1f-t;}
+        if(control==1){n=t;k=1f-t;}
+        if(control==2)ng=.5f+.5f*t;
+        if(control==3)total=t;
+        tuningDraft=new CommandFusion.Config(k,n,ng,total);
+        invalidate();
+    }
+    private void drawSettingSlider(Canvas c,int top,String name,float value,float min,float max,
+                                   String note){
+        box(c,20,top,340,top+80,0xB02D1B2E,11);
+        text(c,name,30,top+22,12,0xFFFFCBDB,true);
+        text(c,String.format(java.util.Locale.ROOT,"%.2f",value),285,top+22,14,0xFFFFA2C2,true);
+        line(c,36,top+54,324,top+54,0x795C3B52,5);
+        float pos=Math.max(0f,Math.min(1f,(value-min)/(max-min)));
+        line(c,36,top+54,36+288*pos,top+54,0xFFFF83B2,5);
+        solid(0xFFFFD5E3);c.drawCircle(36+288*pos,top+54,8,paint);
+        text(c,note,32,top+74,8,0xFFC6A5B4,false);
+    }
+    private void drawFusionTuning(Canvas c){
+        if(tuningDraft==null)tuningDraft=CommandFusion.defaults();
+        center(c,"口令加权识别 / WEIGHTED FUSION",180,176,13,0xFFFFD1E1,true);
+        center(c,"右上角三击返回不保存 · 拖动调整百分比",180,199,9,0xFFBDA0B1,false);
+        drawSettingSlider(c,208,"Zipformer 命中权重",tuningDraft.kwsWeight,0f,1f,
+            "KWS 仅命中=1 / 未命中=0，不是声学概率");
+        drawSettingSlider(c,295,"openWakeWord 权重",tuningDraft.neuralWeight,0f,1f,
+            "双权重合计100%，调整一项自动调整另一项");
+        drawSettingSlider(c,382,"神经相似度门槛",tuningDraft.neuralThreshold,.5f,1f,
+            "低于门槛记0；默认 0.92（未经实机校准）");
+        drawSettingSlider(c,469,"最终综合得分门槛",tuningDraft.totalThreshold,0f,1f,
+            "得分高于门槛才确认；VAD 必须先通过");
+        box(c,20,560,340,639,0xAA261C2D,11);
+        text(c,"计算：KWS×权重 + 个人有效分×权重",31,581,10,0xFFECC3D2,true);
+        text(c,"CAM++ 仅用于声纹录入，不参与日常加权",31,600,9,0xFFC9A7B8,false);
+        text(c,"冲突拒绝 · 单字风险保护 · 不自动发射红外",31,620,9,0xFFFFB3C6,false);
+        box(c,20,650,170,697,0xAF3B2539,11);
+        center(c,"取消修改",95,678,13,0xFFE4B5C9,true);
+        box(c,190,650,340,697,0xC35F2B48,11);
+        center(c,"保存参数",265,678,13,0xFFFFDAE9,true);
     }
     private void add(float l,float t,float r,float b,String title,String sub,RexCommand cmd){
         controls.add(new TouchButton(l,t,r,b,title,sub,cmd));
@@ -240,7 +299,7 @@ public final class RexView extends View {
         if(currentStep>=EnrollmentPrompts.count())enrollmentDone=true;
         awake=awakeNow;
         speaking=speakingNow;
-        if(wakeEvent && page!=PAGE_OWNER && page!=PAGE_TRAIN && page!=PAGE_DIAG)
+        if(wakeEvent && page!=PAGE_OWNER && page!=PAGE_TRAIN && page!=PAGE_DIAG && page!=PAGE_TUNE)
             changePage(PAGE_VOICE); // never interrupt enrollment
         if(text!=null){
             lastText=text;
@@ -288,7 +347,8 @@ public final class RexView extends View {
         text(c,page==PAGE_MANUAL?"TACTICAL MANUAL":
             (page==PAGE_OWNER?"VOICEPRINT / GUIDED ENROLLMENT":
             (page==PAGE_TRAIN?"PERSONALIZED SPEECH COMMANDS":
-            (page==PAGE_DIAG?"LIVE VOICE PIPELINE / DIAGNOSTICS":"VOICE REACTIVE / PARTICLE FIELD"))),
+            (page==PAGE_DIAG?"LIVE VOICE PIPELINE / DIAGNOSTICS":
+            (page==PAGE_TUNE?"VOICE COMMAND / WEIGHTED SETTINGS":"VOICE REACTIVE / PARTICLE FIELD")))),
             25,68,10,0xFFC06A7B,false);
         text(c,"ONEPLUS ACE 3V  ·  ANDROID 16",25,87,9,0xFF8A6674,false);
         box(c,18,115,342,150,0x6C211B27,10);
@@ -511,7 +571,7 @@ public final class RexView extends View {
         text(c,shortText(meta,48),30,top+61,8,0xFFC4A0B0,false);
     }
     private String diagnosticReport(){
-        return "REx v1.2.3 语音链路诊断\n"+
+        return "REx v1.3 语音链路诊断\n"+
             "引擎: "+diagEngine+"\n"+
             String.format(java.util.Locale.ROOT,"PCM: %.1f dBFS, 活动提示=%s, 帧=%d, 丢弃=%d\n",
                 diagDbfs,diagActivity,diagFrames,diagDrops)+
@@ -621,6 +681,7 @@ public final class RexView extends View {
         else if(page==PAGE_OWNER)drawEnrollment(raw);
         else if(page==PAGE_TRAIN)drawCommandTraining(raw);
         else if(page==PAGE_DIAG)drawDiagnostics(raw);
+        else if(page==PAGE_TUNE)drawFusionTuning(raw);
         else if(leaving){
             // Fade the old HUD independently; do not redraw stable filaments
             // underneath the particles that are already scattering.
@@ -650,9 +711,46 @@ public final class RexView extends View {
     @Override public boolean onTouchEvent(MotionEvent e){
         float x=e.getX()*W/getWidth();
         float y=e.getY()*H/getHeight();
-        if(e.getAction()==MotionEvent.ACTION_DOWN){downMs=SystemClock.elapsedRealtime();return true;}
+        if(e.getAction()==MotionEvent.ACTION_DOWN){
+            downMs=SystemClock.elapsedRealtime();
+            tuningDrag=-1;
+            if(page==PAGE_TUNE && x>=20 && x<=340){
+                int[] tops={208,295,382,469};
+                for(int i=0;i<4;i++)if(y>=tops[i]+35 && y<=tops[i]+76){
+                    tuningDrag=i;updateTuning(x,i);break;
+                }
+            }
+            return true;
+        }
+        if(e.getAction()==MotionEvent.ACTION_MOVE && page==PAGE_TUNE && tuningDrag>=0){
+            updateTuning(x,tuningDrag);return true;
+        }
+        if(e.getAction()==MotionEvent.ACTION_CANCEL){tuningDrag=-1;return true;}
         if(e.getAction()==MotionEvent.ACTION_UP){
             long now=SystemClock.elapsedRealtime();
+            // Dedicated top-right triple tap opens / closes parameter editor.
+            // Changes only persist when the SAVE button is explicitly pressed.
+            if((page==PAGE_VOICE||page==PAGE_TUNE) && x>=235 && x<=348 &&
+                    y>=12 && y<=104){
+                tuningTaps=(now-lastTuningTapMs<730)?tuningTaps+1:1;
+                lastTuningTapMs=now;
+                if(tuningTaps>=3){
+                    tuningTaps=0;
+                    if(page==PAGE_TUNE)discardTuning();else openTuning();
+                }
+                return true;
+            }
+            if(page==PAGE_TUNE){
+                if(tuningDrag>=0){updateTuning(x,tuningDrag);tuningDrag=-1;return true;}
+                if(y>=650 && y<=699){
+                    if(x<180)discardTuning();
+                    else if(actions.onSaveFusionSettings(tuningDraft)){
+                        tuningDraft=CommandFusion.load(getContext());
+                        changePage(PAGE_VOICE);
+                    }
+                }
+                return true;
+            }
             // NEW: top-left three taps on the agent page (or the diagnostic
             // page) are the isolated diagnostics shortcut. Original lower
             // left/right triple-tap controls remain unchanged.
