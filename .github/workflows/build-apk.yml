@@ -1,4 +1,4 @@
-name: REx Android v1.3 weighted keyword fusion APK
+name: REx Android v1.4 trainable personal openWakeWord APK
 on:
   workflow_dispatch:
   push:
@@ -46,6 +46,6 @@ jobs:
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: REX-v1.3-weighted-fusion-debug-APK
+          name: REX-v1.4-trained-head-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
