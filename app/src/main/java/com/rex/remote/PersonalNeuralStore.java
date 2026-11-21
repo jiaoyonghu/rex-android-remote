@@ -11,7 +11,7 @@ import java.util.*;
  * Files are app-private, versioned, atomic and disjoint from the old MFCC store.
  */
 public final class PersonalNeuralStore {
-    public static final int MIN_TAKES=6, RECOMMENDED_TAKES=12, MAX_TAKES=20;
+    public static final int MIN_TAKES=6, RECOMMENDED_TAKES=12, MAX_TAKES=30;
     private static final int MAGIC=0x52584E32, VERSION=1;
     private static final int DIM=OpenWakeWordFeatures.DIM;
     private final File directory;
