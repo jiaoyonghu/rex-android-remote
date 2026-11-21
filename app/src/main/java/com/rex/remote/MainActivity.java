@@ -4,6 +4,8 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
+import android.content.ClipboardManager;
+import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -37,6 +39,21 @@ public final class MainActivity extends Activity implements RexView.Actions {
                 i.getIntExtra(VoiceService.EXTRA_ENROLL_STEP,0),
                 i.getBooleanExtra(VoiceService.EXTRA_ENROLL_READY,false),
                 i.getBooleanExtra(VoiceService.EXTRA_ENROLL_CAPTURING,false));
+            view.onDiagnostics(
+                i.getStringExtra(VoiceService.EXTRA_DIAG_ENGINE),
+                i.getFloatExtra(VoiceService.EXTRA_DIAG_DBFS,-90f),
+                i.getBooleanExtra(VoiceService.EXTRA_DIAG_ACTIVITY,false),
+                i.getLongExtra(VoiceService.EXTRA_DIAG_FRAMES,0),
+                i.getLongExtra(VoiceService.EXTRA_DIAG_DROPS,0),
+                i.getStringExtra(VoiceService.EXTRA_DIAG_KWS),
+                i.getStringExtra(VoiceService.EXTRA_DIAG_VAD),
+                i.getStringExtra(VoiceService.EXTRA_DIAG_PERSONAL),
+                i.getStringExtra(VoiceService.EXTRA_DIAG_VERDICT),
+                i.getStringExtra(VoiceService.EXTRA_DIAG_CAUSE),
+                i.getStringExtra(VoiceService.EXTRA_DIAG_TIMING),
+                i.getLongExtra(VoiceService.EXTRA_DIAG_KWS_AT,0),
+                i.getLongExtra(VoiceService.EXTRA_DIAG_VAD_AT,0),
+                i.getLongExtra(VoiceService.EXTRA_DIAG_VERDICT_AT,0));
             String trainEvent=i.getStringExtra(VoiceService.EXTRA_TRAIN_EVENT);
             view.onTraining(i.getIntExtra(VoiceService.EXTRA_TRAIN_INDEX,0),
                 i.getIntExtra(VoiceService.EXTRA_TRAIN_COUNT,0),
@@ -176,6 +193,29 @@ public final class MainActivity extends Activity implements RexView.Actions {
     }
     @Override public void onFinishCommandTraining(){
         sendTrainingAction(VoiceService.ACTION_TRAIN_END,0,false);
+    }
+    @Override public void onCopyDiagnostics(String report){
+        try {
+            ClipboardManager clipboard=(ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+            if(clipboard!=null){
+                clipboard.setPrimaryClip(ClipData.newPlainText("REx语音诊断",report));
+                Toast.makeText(this,"诊断已复制，可直接粘贴到聊天",Toast.LENGTH_SHORT).show();
+            }
+        }catch(Exception ex){
+            view.setMessage("复制诊断失败："+ex.getClass().getSimpleName());
+        }
+    }
+    @Override public void onResetDiagnostics(){
+        if(!view.isVoiceStarted()){
+            view.resetDiagnosticDisplay();
+            return;
+        }
+        try {
+            startService(new Intent(this,VoiceService.class)
+                .setAction(VoiceService.ACTION_DIAG_RESET));
+        }catch(Exception e){
+            view.setMessage("诊断记录清理失败："+e.getClass().getSimpleName());
+        }
     }
     @Override public void onSend(RexCommand cmd) {
         if(cmd==RexCommand.SLEEP||cmd==RexCommand.WAKE)return;

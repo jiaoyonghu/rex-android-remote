@@ -9,11 +9,11 @@ export LC_ALL=C.UTF-8
 src_classes=(RexCommand CommandPhrases CommandAcoustics CommandAudioSegmenter
  CommandActivityGate BilingualCommandRouter EnrollmentPrompts SpeakerMath
  SpeakerProfile SpeechActivityGate CommandTemplateStore VoskGrammar SpeechFusion
- SherpaCommandPolicy VoiceIdentityPolicy PersonalWakePolicy PersonalNeuralStore NeuralWakePolicy)
+ SherpaCommandPolicy VoiceIdentityPolicy PersonalWakePolicy PersonalNeuralStore NeuralWakePolicy VoiceDiagnostics)
 test_classes=(CommandActivityGateTest CommandTest CommandAcousticsTest
  CommandTemplateStoreTest EnrollmentTest SpeakerMathTest SpeechGateTest
  SpeechFusionTest SpeakerProfileTest FarFieldAcousticsTest
- SherpaCommandPolicyTest VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest)
+ SherpaCommandPolicyTest VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest VoiceDiagnosticsTest)
 stubs=(android/content/Context.java android/content/SharedPreferences.java
  android/util/Base64.java org/json/JSONArray.java org/json/JSONException.java)
 missing=()
@@ -50,7 +50,7 @@ for test in CommandActivityGateTest CommandTest EnrollmentTest SpeakerMathTest S
 done
 for test in CommandAcousticsTest CommandTemplateStoreTest SpeechFusionTest \
  SpeakerProfileTest FarFieldAcousticsTest SherpaCommandPolicyTest \
- VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest; do
+ VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest VoiceDiagnosticsTest; do
   java -cp "$out" "com.rex.remote.$test"
 done
-printf 'REX v1.2: all 14 offline Java regression tests PASSED\n'
+printf 'REX diagnostics: all 15 offline Java regression tests PASSED\n'

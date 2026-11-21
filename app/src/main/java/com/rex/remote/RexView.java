@@ -36,6 +36,8 @@ public final class RexView extends View {
         void onCaptureCommandPhrase(int index);
         void onClearCommandPhrase(int index);
         void onFinishCommandTraining();
+        void onResetDiagnostics();
+        void onCopyDiagnostics(String report);
     }
     private static final int W=360,H=780;
     private final Actions actions;
@@ -47,7 +49,8 @@ public final class RexView extends View {
     private final float[] py=new float[1940];
     private final float[] corePx=new float[1248];
     private final float[] corePy=new float[1248];
-    private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2,PAGE_TRAIN=3;
+    private static final int PAGE_VOICE=0,PAGE_MANUAL=1,PAGE_OWNER=2,PAGE_TRAIN=3,
+        PAGE_DIAG=4;
     // Voice-page-only transition: native particle positions <-> stable,
     // screen-wide scattering positions. All other page changes remain instant.
     private static final long PARTICLE_TRANSITION_MS=720;
@@ -64,7 +67,7 @@ public final class RexView extends View {
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v1.2 · 个人神经口令 · 语音红外未授权";
+    private String message="v1.2.3 · 语音诊断 · 语音红外未授权";
     private String irStatus="正在检测 IR";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
@@ -79,6 +82,14 @@ public final class RexView extends View {
     private long lastLeftTapMs;
     private long lastRightTapMs;
     private int leftTaps,rightTaps;
+    private int diagnosticTaps;
+    private long lastDiagnosticTapMs;
+    private String diagEngine="未启动",diagKws="未捕获关键词",diagVad="尚无完整语音片段",
+        diagPersonal="未评估",diagVerdict="尚无最终裁决",
+        diagCause="请启动语音并说出一条固定指令",diagTiming="暂无耗时数据";
+    private float diagDbfs=-90f;
+    private boolean diagActivity;
+    private long diagFrames,diagDrops,diagKwsAt,diagVadAt,diagVerdictAt;
     private long downMs;
     private final long startedAt=SystemClock.elapsedRealtime();
     private final Typeface regular=Typeface.create("sans-serif",Typeface.NORMAL);
@@ -192,6 +203,26 @@ public final class RexView extends View {
             "TRAIN_SELECTED".equals(event))trainCapturing=false;
         invalidate();
     }
+    public void onDiagnostics(String engine,float dbfs,boolean activity,long frames,long drops,
+                              String kws,String vad,String personal,String verdict,
+                              String cause,String timing,long kwsAt,long vadAt,long verdictAt){
+        if(engine!=null)diagEngine=engine;
+        diagDbfs=dbfs;diagActivity=activity;diagFrames=frames;diagDrops=drops;
+        if(kws!=null)diagKws=kws;
+        if(vad!=null)diagVad=vad;
+        if(personal!=null)diagPersonal=personal;
+        if(verdict!=null)diagVerdict=verdict;
+        if(cause!=null)diagCause=cause;
+        if(timing!=null)diagTiming=timing;
+        diagKwsAt=kwsAt;diagVadAt=vadAt;diagVerdictAt=verdictAt;
+        if(page==PAGE_DIAG)invalidate();
+    }
+    public boolean isVoiceStarted(){return voiceStarted;}
+    public void resetDiagnosticDisplay(){
+        onDiagnostics("未启动",-90f,false,0,0,"未捕获关键词",
+            "尚无完整语音片段","未评估","尚无最终裁决",
+            "记录已清空，请启动监听并说一条指令","暂无耗时数据",0,0,0);
+    }
     public void setVoiceStopped(){
         voiceStarted=false;voiceStatus="语音监听已关闭";speaking=false;awake=false;invalidate();
     }
@@ -209,7 +240,7 @@ public final class RexView extends View {
         if(currentStep>=EnrollmentPrompts.count())enrollmentDone=true;
         awake=awakeNow;
         speaking=speakingNow;
-        if(wakeEvent && page!=PAGE_OWNER && page!=PAGE_TRAIN)
+        if(wakeEvent && page!=PAGE_OWNER && page!=PAGE_TRAIN && page!=PAGE_DIAG)
             changePage(PAGE_VOICE); // never interrupt enrollment
         if(text!=null){
             lastText=text;
@@ -256,7 +287,8 @@ public final class RexView extends View {
         text(c,"R E X",25,48,27,0xFFFFDCE0,true);
         text(c,page==PAGE_MANUAL?"TACTICAL MANUAL":
             (page==PAGE_OWNER?"VOICEPRINT / GUIDED ENROLLMENT":
-            (page==PAGE_TRAIN?"PERSONALIZED SPEECH COMMANDS":"VOICE REACTIVE / PARTICLE FIELD")),
+            (page==PAGE_TRAIN?"PERSONALIZED SPEECH COMMANDS":
+            (page==PAGE_DIAG?"LIVE VOICE PIPELINE / DIAGNOSTICS":"VOICE REACTIVE / PARTICLE FIELD"))),
             25,68,10,0xFFC06A7B,false);
         text(c,"ONEPLUS ACE 3V  ·  ANDROID 16",25,87,9,0xFF8A6674,false);
         box(c,18,115,342,150,0x6C211B27,10);
@@ -466,6 +498,68 @@ public final class RexView extends View {
         text(c,shortText(lastText,37),30,675,9,0xFFFFC5D4,false);
         text(c,shortText(ownerStatus,38),30,690,8,0xFFD2A2B7,false);
     }
+    private String ageFor(long eventAt){
+        if(eventAt<=0)return "无事件";
+        long seconds=Math.max(0,(SystemClock.elapsedRealtime()-eventAt)/1000);
+        return seconds<120?seconds+"秒前":"超过2分钟";
+    }
+    private void diagRow(Canvas c,int top,String number,String heading,String detail,String meta){
+        box(c,20,top,340,top+72,0xB12B1B2D,11);
+        text(c,number,30,top+22,13,0xFFFF9EB9,true);
+        text(c,heading,61,top+21,12,0xFFFFD2DE,true);
+        text(c,shortText(detail,37),30,top+44,10,0xFFF1C2D2,false);
+        text(c,shortText(meta,48),30,top+61,8,0xFFC4A0B0,false);
+    }
+    private String diagnosticReport(){
+        return "REx v1.2.3 语音链路诊断\n"+
+            "引擎: "+diagEngine+"\n"+
+            String.format(java.util.Locale.ROOT,"PCM: %.1f dBFS, 活动提示=%s, 帧=%d, 丢弃=%d\n",
+                diagDbfs,diagActivity,diagFrames,diagDrops)+
+            "KWS: "+diagKws+" ("+ageFor(diagKwsAt)+")\n"+
+            "VAD: "+diagVad+" ("+ageFor(diagVadAt)+")\n"+
+            "个人模型: "+diagPersonal+"\n"+
+            "最终裁决: "+diagVerdict+" ("+ageFor(diagVerdictAt)+")\n"+
+            "卡点提示: "+diagnosticHint()+"\n"+
+            "阶段耗时: "+diagTiming+"\n"+
+            "注：音量活动提示不等于VAD通过；不保存原始录音。";
+    }
+    private String diagnosticHint(){
+        long now=SystemClock.elapsedRealtime();
+        if(diagDrops>0)return "存在过期录音丢弃：请检查模型计算负载";
+        if(diagKwsAt>diagVadAt && diagKwsAt>0 && now-diagKwsAt>3000)
+            return "KWS已命中但VAD未出段：请检查语音分段";
+        if(diagVadAt>0 && diagKwsAt==0 && diagVerdictAt>=diagVadAt)
+            return "VAD已收到语音，但KWS未命中：检查发音或阈值";
+        return diagCause;
+    }
+    private void drawDiagnostics(Canvas c){
+        center(c,"实时语音链路诊断 · 仅观察，不改阈值",180,178,13,0xFFFFD4E1,true);
+        center(c,"每说一次固定口令，观察停在哪一阶段",180,197,9,0xFFC6A5B4,false);
+        diagRow(c,209,"01","麦克风 / PCM",
+            String.format(java.util.Locale.ROOT,"音量 %.1f dBFS · %s",diagDbfs,
+                diagActivity?"声音活动提示":"未触发活动提示"),
+            "已读 "+diagFrames+" 帧 · 丢弃队列 "+diagDrops+" 次 · "+shortText(diagEngine,19));
+        diagRow(c,286,"02","Zipformer KWS（实时）",diagKws,
+            "最近 KWS 事件 "+ageFor(diagKwsAt)+" · 只检测预设关键词");
+        diagRow(c,363,"03","Silero VAD（语音分段）",diagVad,
+            "最近 VAD 片段 "+ageFor(diagVadAt)+" · 与音量活动提示独立");
+        diagRow(c,440,"04","个人神经模板（按需）",diagPersonal,
+            "TFLite 特征 · 未训练时不会执行个人匹配");
+        diagRow(c,517,"05","最终裁决",diagVerdict,
+            "最近裁决 "+ageFor(diagVerdictAt)+" · 不连接红外动作");
+        box(c,20,594,340,647,0xBA402339,10);
+        text(c,shortText(diagnosticHint(),35),29,611,10,0xFFFFC6D8,true);
+        text(c,shortText(diagTiming,57),29,627,8,0xFFE2B3C9,false);
+        text(c,"没有VAD片段时无法确认原因；请结合KWS和音量观察",29,641,8,0xFFB78A9F,false);
+        box(c,20,656,120,699,0xAD502842,10);
+        center(c,voiceStarted?"监听运行中":"启动监听",70,673,10,0xFFFFD4E1,true);
+        center(c,"长按关闭",70,690,8,0xFFCAA1B4,false);
+        box(c,129,656,229,699,0xA83B2A3C,10);
+        center(c,"清空记录",179,673,10,0xFFFFD4E1,true);
+        center(c,"长按复制",179,690,8,0xFFCAA1B4,false);
+        box(c,238,656,340,699,0xAD502842,10);
+        center(c,"返回智能体",289,682,10,0xFFFFD4E1,true);
+    }
     private void drawCommandTraining(Canvas c){
         center(c,"个性化口令训练 / COMMAND TRAINING",180,187,15,0xFFFFC6D7,true);
         center(c,"openWakeWord 深层语音特征 · 个人分类器持续训练",180,211,9,0xFFCDA8B9,false);
@@ -526,6 +620,7 @@ public final class RexView extends View {
         if(page==PAGE_MANUAL)drawControls(raw);
         else if(page==PAGE_OWNER)drawEnrollment(raw);
         else if(page==PAGE_TRAIN)drawCommandTraining(raw);
+        else if(page==PAGE_DIAG)drawDiagnostics(raw);
         else if(leaving){
             // Fade the old HUD independently; do not redraw stable filaments
             // underneath the particles that are already scattering.
@@ -558,6 +653,31 @@ public final class RexView extends View {
         if(e.getAction()==MotionEvent.ACTION_DOWN){downMs=SystemClock.elapsedRealtime();return true;}
         if(e.getAction()==MotionEvent.ACTION_UP){
             long now=SystemClock.elapsedRealtime();
+            // NEW: top-left three taps on the agent page (or the diagnostic
+            // page) are the isolated diagnostics shortcut. Original lower
+            // left/right triple-tap controls remain unchanged.
+            if((page==PAGE_VOICE||page==PAGE_DIAG) && x>=12 && x<=125 && y>=12 && y<=104){
+                diagnosticTaps=(now-lastDiagnosticTapMs<730)?diagnosticTaps+1:1;
+                lastDiagnosticTapMs=now;
+                if(diagnosticTaps>=3){
+                    diagnosticTaps=0;
+                    changePage(page==PAGE_DIAG?PAGE_VOICE:PAGE_DIAG);
+                }
+                return true;
+            }
+            if(page==PAGE_DIAG){
+                if(y>=656 && y<=699){
+                    if(x<123){
+                        if(now-downMs>1100)actions.onStopVoice();
+                        else actions.onStartVoice();
+                    }else if(x<233){
+                        if(now-downMs>800)actions.onCopyDiagnostics(diagnosticReport());
+                        else actions.onResetDiagnostics();
+                    }
+                    else changePage(PAGE_VOICE);
+                }
+                return true;
+            }
             // Symmetric large blanks immediately LEFT and RIGHT of centered REX.
             if(y>=526 && y<=584 && x>=22 && x<=140){
                 leftTaps=(now-lastLeftTapMs<730)?leftTaps+1:1;

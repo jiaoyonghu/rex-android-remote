@@ -27,6 +27,12 @@ public final class SherpaVoiceEngine implements AutoCloseable {
             this.pcm=pcm;this.keyword=keyword;this.conflictingKeywords=conflict;
         }
     }
+    /** Events originate from the actual streaming KWS and Silero VAD instances. */
+    public interface DiagnosticsListener {
+        void onKwsHit(String keyword,boolean conflict);
+        void onVadSegment(int samples,boolean accepted,String keyword);
+    }
+    private final DiagnosticsListener diagnostics;
     private final KeywordSpotter kws;
     private SpeakerEmbeddingExtractor speaker;
     private final File folder;
@@ -38,8 +44,10 @@ public final class SherpaVoiceEngine implements AutoCloseable {
     private String keyword="";
     private boolean conflict;
     private final List<Clip> completed=new ArrayList<>();
-    public SherpaVoiceEngine(File folder){
+    public SherpaVoiceEngine(File folder){this(folder,null);}
+    public SherpaVoiceEngine(File folder,DiagnosticsListener diagnostics){
         this.folder=folder;
+        this.diagnostics=diagnostics;
         String prefix="epoch-13-avg-2-chunk-16-left-64";
         OnlineTransducerModelConfig t=OnlineTransducerModelConfig.builder()
             .setEncoder(new File(folder,"encoder-"+prefix+".int8.onnx").getAbsolutePath())
@@ -60,7 +68,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
         stream=kws.createStream();
         SileroVadModelConfig s=SileroVadModelConfig.builder()
             .setModel(new File(folder,"silero_vad.onnx").getAbsolutePath())
-            .setThreshold(0.45f).setMinSpeechDuration(0.18f)
+            .setThreshold(0.52f).setMinSpeechDuration(0.18f)
             .setMinSilenceDuration(0.22f).setMaxSpeechDuration(5f)
             .setWindowSize(512).build();
         VadModelConfig v=VadModelConfig.builder()
@@ -110,6 +118,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
             String hit=kws.getResult(stream).getKeyword();
             if(hit!=null && !hit.isEmpty()){
                 addKeyword(hit);
+                if(diagnostics!=null)diagnostics.onKwsHit(hit,conflict);
                 // Official sherpa-onnx KWS examples reset immediately after a
                 // hit. The VAD segment is maintained separately.
                 kws.reset(stream);
@@ -123,7 +132,10 @@ public final class SherpaVoiceEngine implements AutoCloseable {
                 while(!vad.empty()){
                     float[] samples=vad.front().getSamples();
                     vad.pop();
-                    if(samples.length>=2400 && samples.length<=80000){
+                    boolean accepted=samples.length>=2400 && samples.length<=80000;
+                    if(diagnostics!=null)
+                        diagnostics.onVadSegment(samples.length,accepted,keyword);
+                    if(accepted){
                         short[] out=new short[samples.length];
                         for(int i=0;i<samples.length;i++)
                             out[i]=(short)Math.round(Math.max(-1,Math.min(1,samples[i]))*32767f);

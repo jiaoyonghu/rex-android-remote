@@ -34,6 +34,21 @@ import java.util.concurrent.TimeUnit;
 public final class VoiceService extends Service {
     public static final String ACTION_EVENT="com.rex.remote.VOICE_EVENT";
     public static final String ACTION_STOP="com.rex.remote.STOP_VOICE";
+    public static final String ACTION_DIAG_RESET="com.rex.remote.DIAG_RESET";
+    public static final String EXTRA_DIAG_ENGINE="diag_engine";
+    public static final String EXTRA_DIAG_DBFS="diag_dbfs";
+    public static final String EXTRA_DIAG_ACTIVITY="diag_activity";
+    public static final String EXTRA_DIAG_FRAMES="diag_frames";
+    public static final String EXTRA_DIAG_DROPS="diag_drops";
+    public static final String EXTRA_DIAG_KWS="diag_kws";
+    public static final String EXTRA_DIAG_VAD="diag_vad";
+    public static final String EXTRA_DIAG_PERSONAL="diag_personal";
+    public static final String EXTRA_DIAG_VERDICT="diag_verdict";
+    public static final String EXTRA_DIAG_CAUSE="diag_cause";
+    public static final String EXTRA_DIAG_TIMING="diag_timing";
+    public static final String EXTRA_DIAG_KWS_AT="diag_kws_at";
+    public static final String EXTRA_DIAG_VAD_AT="diag_vad_at";
+    public static final String EXTRA_DIAG_VERDICT_AT="diag_verdict_at";
     public static final String ACTION_TRAIN_BEGIN="com.rex.remote.TRAIN_BEGIN";
     public static final String ACTION_TRAIN_SELECT="com.rex.remote.TRAIN_SELECT";
     public static final String ACTION_TRAIN_CAPTURE="com.rex.remote.TRAIN_CAPTURE";
@@ -72,6 +87,8 @@ public final class VoiceService extends Service {
     private static final boolean ENABLE_PERSONAL_NEURAL=true;
     private static final String SHERPA_MODEL_ZIP="rex-sherpa-kws-zh-en-v1.zip";
     private static final String SHERPA_MODEL_FOLDER="rex-sherpa-kws-zh-en-v1";
+    // Observation-only state: diagnostics cannot authorize speech commands.
+    private final VoiceDiagnostics diagnostics=new VoiceDiagnostics();
     private final ArrayBlockingQueue<AudioFrame> audioFrames=new ArrayBlockingQueue<>(16);
     private volatile boolean droppedAudio;
 
@@ -116,6 +133,10 @@ public final class VoiceService extends Service {
     @Override public int onStartCommand(Intent intent,int flags,int startId){
         String action=intent==null?"":intent.getAction();
         if(ACTION_STOP.equals(action)){stopSelf();return START_NOT_STICKY;}
+        if(ACTION_DIAG_RESET.equals(action)){
+            diagnostics.reset();publish(null,null,null,false,0f);
+            if(!running)stopSelf();return START_NOT_STICKY;
+        }
         int requestedStep=intent==null?0:intent.getIntExtra(EXTRA_ENROLL_STEP,0);
         int requestedPhrase=intent==null?0:intent.getIntExtra(EXTRA_TRAIN_INDEX,0);
         if(ACTION_TRAIN_BEGIN.equals(action)||ACTION_TRAIN_SELECT.equals(action)){
@@ -262,12 +283,21 @@ public final class VoiceService extends Service {
         // supervised recording button supplies the label; use actual audio
         // quality and within-phrase consistency checks instead. It is NOT
         // subsequently allowed to trigger an action without KWS evidence.
+        long measureStarted=SystemClock.elapsedRealtime();
         float[] vector=features==null?null:features.embed(clip.pcm);
         String failure=features==null?
             "个人神经模型不可用；基础关键词监听继续运行":neural.add(clip.phrase,vector);
-        if(failure!=null){trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");}
+        if(failure!=null){
+            diagnostics.onPersonal("训练失败："+failure);
+            diagnostics.onVerdict("训练未保存",failure,
+                SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-measureStarted);
+            trainingInfo="采集失败："+failure;publishTraining("TRAIN_FAIL");
+        }
         else {
             int n=neural.count(clip.phrase);trainingCount=n;
+            diagnostics.onPersonal("训练成功："+CommandPhrases.at(clip.phrase)+" · "+n+" 条样本");
+            diagnostics.onVerdict("训练已保存","个人特征写入本机",
+                SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-measureStarted);
             trainingInfo="『"+CommandPhrases.at(clip.phrase)+"』已采集 "+n+
                 "/20"+(n>=PersonalNeuralStore.MIN_TAKES?
                 " · 个人神经模型已参与识别，建议录至12次":
@@ -344,16 +374,34 @@ public final class VoiceService extends Service {
             return;
         }
         long now=SystemClock.elapsedRealtime();
+        long decisionStarted=now;
         String keyword=clip.keyword;
         SherpaCommandPolicy.Decision kws=SherpaCommandPolicy.decide(
             keyword,awake,null,clip.conflictingKeywords);
-        if(clip.conflictingKeywords){neuralWake.clear();return;}
+        if(clip.conflictingKeywords){
+            neuralWake.clear();
+            diagnostics.onPersonal("未执行：KWS候选互相冲突");
+            diagnostics.onVerdict("拒绝输出","同段语音存在不同关键词冲突",
+                SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
+            return;
+        }
         boolean trained=false;
         for(int i=0;i<CommandPhrases.count();i++){
             if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES){trained=true;break;}
         }
+        long personalStarted=SystemClock.elapsedRealtime();
         PersonalNeuralStore.Result match=trained && features!=null?
             neural.evaluate(features.embed(clip.pcm)):null;
+        if(match==null){
+            diagnostics.onPersonal(!trained?"未启用：没有达到6条的训练口令":
+                features==null?"不可用：个人TFLite模型未加载":"没有有效的个人匹配结果");
+        }else{
+            diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
+                "%s · %.3f / 门槛 %.3f · %d条样本 · %dms",
+                match.accepted?"个人匹配通过":"个人匹配未通过",
+                match.score,match.threshold,match.samples,
+                SystemClock.elapsedRealtime()-personalStarted));
+        }
         RexCommand command=kws.command;
         boolean wake=kws.wake;
         String explanation=kws.reason;
@@ -369,6 +417,8 @@ public final class VoiceService extends Service {
                     wake=true;explanation="个人神经唤醒两次强匹配 · 非身份认证";
                 }else{
                     status="个人神经唤醒第1次匹配，请在4秒内再说一次";
+                    diagnostics.onVerdict("等待第二次唤醒","首次个人唤醒强匹配，需要4秒内再次确认",
+                        SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
                     publish("个人神经唤醒待确认",null,null,false,0f);
                     return;
                 }
@@ -388,6 +438,10 @@ public final class VoiceService extends Service {
             }
         }else if(!keyword.isEmpty())neuralWake.clear();
         if(!wake && command==null){
+            diagnostics.onVerdict("未输出",keyword.isEmpty()?
+                "VAD已检测到语音，但KWS未命中；个人模型也未满足补救条件":
+                "候选未通过："+explanation,
+                SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
             if(!keyword.isEmpty()){
                 status="未输出口令 · "+explanation;
                 publish("关键词: "+keyword,null,null,false,0f);
@@ -396,7 +450,11 @@ public final class VoiceService extends Service {
         }
         if(wake)neuralWake.clear();
         String signature=String.valueOf(command)+"|"+wake+"|"+keyword;
-        if(signature.equals(lastFinalSignature)&&now-lastFinalMs<750)return;
+        if(signature.equals(lastFinalSignature)&&now-lastFinalMs<750){
+            diagnostics.onVerdict("重复结果已抑制","750ms内相同候选被去重",
+                SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
+            return;
+        }
         lastFinalSignature=signature;lastFinalMs=now;
         if(wake || (command!=null && RexCommand.stripWakePrefix(keyword)!=null &&
                    !RexCommand.stripWakePrefix(keyword).isEmpty()))awake=true;
@@ -406,12 +464,17 @@ public final class VoiceService extends Service {
         else if(command==RexCommand.SLEEP)status="已睡眠";
         else status="识别『"+command.label+"』· "+explanation+
             " · 仅预览，不发送运动红外";
+        diagnostics.onVerdict(wake?"唤醒成功":command==RexCommand.SLEEP?
+                "进入待机":"识别成功："+command.label,
+            explanation,SystemClock.elapsedRealtime(),
+            SystemClock.elapsedRealtime()-decisionStarted);
         publish("关键词: "+keyword+(match!=null?" | 神经得分 " +
                 String.format(java.util.Locale.ROOT,"%.2f",match.score):""),
             null,command,wake,0f);
     }
     private void recognitionLoop(){
         try{
+            diagnostics.onEngine("正在准备模型文件");
             File kwsDir=unpackSherpaModel();
             if(!running)return;
             updateStatus("启动 Zipformer KWS + Silero VAD + openWakeWord 个人神经模型…");
@@ -419,7 +482,15 @@ public final class VoiceService extends Service {
             // A missing/broken personal model must not terminate the primary KWS.
             OpenWakeWordFeatures personalFeatures=null;
             boolean personalUnavailable=false;
-            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir)){
+            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir,
+                new SherpaVoiceEngine.DiagnosticsListener(){
+                    @Override public void onKwsHit(String hit,boolean conflict){
+                        diagnostics.onKeyword(hit,conflict,SystemClock.elapsedRealtime());
+                    }
+                    @Override public void onVadSegment(int samples,boolean accepted,String keyword){
+                        diagnostics.onVad(samples,accepted,keyword,SystemClock.elapsedRealtime());
+                    }
+                })){
                 int minimum=AudioRecord.getMinBufferSize(SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
                 if(minimum<=0)throw new IllegalStateException("不支持16kHz麦克风");
@@ -440,6 +511,7 @@ public final class VoiceService extends Service {
                         if(agc!=null)agc.setEnabled(true);
                     }}catch(Exception ex){Log.w(TAG,"AGC unavailable",ex);}
                     mic.startRecording();
+                    diagnostics.onEngine("麦克风已启动，KWS/VAD运行中");
                     updateStatus("流式监听 · KWS + VAD + 个人神经口令 · 仅预览");
                     Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic-v12");
                     capture.start();
@@ -466,9 +538,11 @@ public final class VoiceService extends Service {
                             if(needPersonal && personalFeatures==null && !personalUnavailable){
                                 try{
                                     personalFeatures=new OpenWakeWordFeatures(this);
-                                    Log.i(TAG,"Personal ONNX frontend loaded on demand");
+                                    Log.i(TAG,"Personal neural frontend loaded on demand");
                                 }catch(Exception | LinkageError ex){
                                     personalUnavailable=true;
+                                    diagnostics.onPersonal("个人神经模型加载失败："+ex.getClass().getSimpleName());
+                                    diagnostics.onError("TFLite初始化",ex.getClass().getSimpleName());
                                     Log.e(TAG,"Optional personal ONNX frontend unavailable; KWS continues",ex);
                                     status="个人模型暂不可用；基础关键词识别继续运行";
                                     publish(null,null,null,false,0f);
@@ -477,6 +551,7 @@ public final class VoiceService extends Service {
                             try{
                                 recognizeSherpaClip(clip,gen,engine,personalFeatures);
                             }catch(RuntimeException ex){
+                                diagnostics.onError("单段裁决",ex.getClass().getSimpleName());
                                 Log.e(TAG,"One voice clip failed; continuous KWS kept alive",ex);
                                 status="单条语音处理出错，已跳过并继续监听";
                                 publish(null,null,null,false,0f);
@@ -494,6 +569,8 @@ public final class VoiceService extends Service {
             }
         }catch(Exception ex){
             if(running){
+                diagnostics.onError("音频主引擎",ex.getClass().getSimpleName());
+                diagnostics.onEngine("已停止："+ex.getClass().getSimpleName());
                 Log.e(TAG,"REx KWS/openWakeWord audio pipeline failed",ex);
                 status="神经识别启动失败："+ex.getClass().getSimpleName()+" "+String.valueOf(ex.getMessage());
                 publish(null,null,null,false,0f);
@@ -512,6 +589,7 @@ public final class VoiceService extends Service {
                 if(n==0)continue;
                 float energy=activityGate.process(reusable,n);
                 speaking=activityGate.isActive();
+                diagnostics.onAudio(reusable,n,speaking);
                 long now=SystemClock.elapsedRealtime();
                 if(trainingArmed && now>trainingDeadline){
                     trainingArmed=false;trainingInfo="采集超时：未取得有效语音，请重试";
@@ -527,6 +605,7 @@ public final class VoiceService extends Service {
                 AudioFrame frame=new AudioFrame(copy,captureGeneration);
                 if(!audioFrames.offer(frame)){
                     audioFrames.clear();droppedAudio=true;
+                    diagnostics.onDroppedAudio();
                     audioFrames.offer(frame); // never combine stale and fresh utterances
                     status="识别负载较高，已清空过期录音，避免误认";
                 }
@@ -536,6 +615,8 @@ public final class VoiceService extends Service {
             }
         }catch(Exception e){
             if(running){
+                diagnostics.onError("麦克风采集",e.getClass().getSimpleName());
+                diagnostics.onEngine("已停止：麦克风异常");
                 Log.e(TAG,"Live microphone capture stopped",e);
                 status="麦克风录音中断："+String.valueOf(e.getMessage());
                 publish(null,null,null,false,0f);
@@ -598,9 +679,25 @@ public final class VoiceService extends Service {
             i.putExtra(EXTRA_ENROLL_READY,enrollReady);
             i.putExtra(EXTRA_ENROLL_CAPTURING,enrollArmed);
         }
+        VoiceDiagnostics.Snapshot d=diagnostics.snapshot();
+        i.putExtra(EXTRA_DIAG_ENGINE,d.engine);
+        i.putExtra(EXTRA_DIAG_DBFS,d.dbfs);
+        i.putExtra(EXTRA_DIAG_ACTIVITY,d.activity);
+        i.putExtra(EXTRA_DIAG_FRAMES,d.frames);
+        i.putExtra(EXTRA_DIAG_DROPS,d.dropped);
+        i.putExtra(EXTRA_DIAG_KWS,d.keyword);
+        i.putExtra(EXTRA_DIAG_VAD,d.vad);
+        i.putExtra(EXTRA_DIAG_PERSONAL,d.personal);
+        i.putExtra(EXTRA_DIAG_VERDICT,d.verdict);
+        i.putExtra(EXTRA_DIAG_CAUSE,d.cause);
+        i.putExtra(EXTRA_DIAG_TIMING,d.timing);
+        i.putExtra(EXTRA_DIAG_KWS_AT,d.kwsAt);
+        i.putExtra(EXTRA_DIAG_VAD_AT,d.vadAt);
+        i.putExtra(EXTRA_DIAG_VERDICT_AT,d.verdictAt);
         sendBroadcast(i);
     }
     @Override public void onDestroy(){
+        diagnostics.onEngine("语音服务已关闭");
         running=false;
         AudioRecord mic=recording;
         if(mic!=null)try{mic.stop();}catch(Exception ignored){}
