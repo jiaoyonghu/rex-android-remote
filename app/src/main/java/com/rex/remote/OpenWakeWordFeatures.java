@@ -13,7 +13,7 @@ import org.tensorflow.lite.Interpreter;
  * Frozen openWakeWord v0.5.1 TFLite MEL + Google Speech Embedding frontend.
  * This avoids loading a second incompatible ONNX Runtime JNI into sherpa's app.
  * Not a speaker-verification model and not an end-to-end trained wakeword head.
- * Invoked on the existing single audio decode thread only.
+ * v1.5: invoked only by the isolated neural worker; buffers are reused.
  */
 public final class OpenWakeWordFeatures implements Closeable {
     public static final int DIM = 16 * 96;
@@ -24,6 +24,8 @@ public final class OpenWakeWordFeatures implements Closeable {
     private static final int STEPS = 16;
     private final Interpreter mel;
     private final Interpreter speech;
+    private final ByteBuffer audioBuffer,spectrumBuffer,patchBuffer,embeddingBuffer;
+    private final float[] flatSpectrum;
 
     public OpenWakeWordFeatures(Context context) throws IOException {
         Interpreter.Options options = new Interpreter.Options();
@@ -43,6 +45,13 @@ public final class OpenWakeWordFeatures implements Closeable {
             }
             mel = m;
             speech = s;
+            audioBuffer=floats(CONTEXT);
+            spectrumBuffer=ByteBuffer.allocateDirect(m.getOutputTensor(0).numBytes())
+                .order(ByteOrder.nativeOrder());
+            embeddingBuffer=ByteBuffer.allocateDirect(s.getOutputTensor(0).numBytes())
+                .order(ByteOrder.nativeOrder());
+            patchBuffer=floats(STEPS*MEL_WINDOW*MEL_BINS);
+            flatSpectrum=new float[spectrumBuffer.capacity()/4];
         } catch (RuntimeException | LinkageError ex) {
             if (s != null) s.close();
             if (m != null) m.close();
@@ -77,7 +86,8 @@ public final class OpenWakeWordFeatures implements Closeable {
     public float[] embed(short[] pcm) {
         if (pcm == null || pcm.length < 3200 || pcm.length > RATE * 5) return null;
         try {
-            ByteBuffer audio = floats(CONTEXT);
+            ByteBuffer audio = audioBuffer;
+            audio.clear();
             int used = Math.min(pcm.length, CONTEXT - 3200);
             int start = (CONTEXT - used) / 2;
             int from = Math.max(0, pcm.length - used);
@@ -86,28 +96,28 @@ public final class OpenWakeWordFeatures implements Closeable {
                 audio.putFloat(sample);
             }
             audio.rewind();
-            ByteBuffer spectrum = ByteBuffer.allocateDirect(mel.getOutputTensor(0).numBytes())
-                    .order(ByteOrder.nativeOrder());
-            mel.run(audio, spectrum);
+            ByteBuffer spectrum=spectrumBuffer;
+            spectrum.clear();
+            mel.run(audio,spectrum);
             spectrum.rewind();
-            int floats = spectrum.remaining() / 4;
+            int floats = flatSpectrum.length;
             if (floats % MEL_BINS != 0) return null;
             int frames = floats / MEL_BINS;
             if (frames < MEL_WINDOW) return null;
-            float[] flat = new float[floats];
-            for (int i = 0; i < floats; i++) flat[i] = spectrum.getFloat() / 10f + 2f;
+            for (int i = 0; i < floats; i++) flatSpectrum[i] = spectrum.getFloat() / 10f + 2f;
 
-            ByteBuffer patches = floats(STEPS * MEL_WINDOW * MEL_BINS);
+            ByteBuffer patches=patchBuffer;
+            patches.clear();
             int maxStart = frames - MEL_WINDOW;
             for (int step = 0; step < STEPS; step++) {
                 int offset = Math.round(step * (maxStart / (float)(STEPS - 1)));
                 for (int i = 0; i < MEL_WINDOW * MEL_BINS; i++) {
-                    patches.putFloat(flat[offset * MEL_BINS + i]);
+                    patches.putFloat(flatSpectrum[offset * MEL_BINS + i]);
                 }
             }
             patches.rewind();
-            ByteBuffer embeddings = ByteBuffer.allocateDirect(speech.getOutputTensor(0).numBytes())
-                    .order(ByteOrder.nativeOrder());
+            ByteBuffer embeddings=embeddingBuffer;
+            embeddings.clear();
             speech.run(patches, embeddings);
             embeddings.rewind();
             if (embeddings.remaining() / 4 < DIM) return null;

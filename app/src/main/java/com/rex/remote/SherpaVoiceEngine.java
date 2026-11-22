@@ -44,28 +44,34 @@ public final class SherpaVoiceEngine implements AutoCloseable {
     private String keyword="";
     private boolean conflict;
     private final List<Clip> completed=new ArrayList<>();
-    public SherpaVoiceEngine(File folder){this(folder,null);}
-    public SherpaVoiceEngine(File folder,DiagnosticsListener diagnostics){
+    public SherpaVoiceEngine(File folder){this(folder,null,true);}
+    public SherpaVoiceEngine(File folder,DiagnosticsListener diagnostics){this(folder,diagnostics,true);}
+    /** v1.5 runs Silero VAD + optional CAM++ WITHOUT loading Zipformer. */
+    public SherpaVoiceEngine(File folder,DiagnosticsListener diagnostics,boolean enableKws){
         this.folder=folder;
         this.diagnostics=diagnostics;
-        String prefix="epoch-13-avg-2-chunk-16-left-64";
-        OnlineTransducerModelConfig t=OnlineTransducerModelConfig.builder()
-            .setEncoder(new File(folder,"encoder-"+prefix+".int8.onnx").getAbsolutePath())
-            .setDecoder(new File(folder,"decoder-"+prefix+".onnx").getAbsolutePath())
-            .setJoiner(new File(folder,"joiner-"+prefix+".int8.onnx").getAbsolutePath())
-            .build();
-        OnlineModelConfig m=OnlineModelConfig.builder()
-            .setTransducer(t)
-            .setTokens(new File(folder,"tokens.txt").getAbsolutePath())
-            .setNumThreads(2).setDebug(false).build();
-        KeywordSpotterConfig k=KeywordSpotterConfig.builder()
-            .setFeatureConfig(FeatureConfig.builder().setSampleRate(16000).build())
-            .setOnlineModelConfig(m)
-            .setKeywordsFile(new File(folder,"keywords.txt").getAbsolutePath())
-            .setMaxActivePaths(4).setKeywordsScore(1.0f)
-            .setKeywordsThreshold(0.40f).setNumTrailingBlanks(1).build();
-        kws=new KeywordSpotter(k);
-        stream=kws.createStream();
+        if(enableKws){
+            String prefix="epoch-13-avg-2-chunk-16-left-64";
+            OnlineTransducerModelConfig t=OnlineTransducerModelConfig.builder()
+                .setEncoder(new File(folder,"encoder-"+prefix+".int8.onnx").getAbsolutePath())
+                .setDecoder(new File(folder,"decoder-"+prefix+".onnx").getAbsolutePath())
+                .setJoiner(new File(folder,"joiner-"+prefix+".int8.onnx").getAbsolutePath())
+                .build();
+            OnlineModelConfig m=OnlineModelConfig.builder()
+                .setTransducer(t)
+                .setTokens(new File(folder,"tokens.txt").getAbsolutePath())
+                .setNumThreads(2).setDebug(false).build();
+            KeywordSpotterConfig k=KeywordSpotterConfig.builder()
+                .setFeatureConfig(FeatureConfig.builder().setSampleRate(16000).build())
+                .setOnlineModelConfig(m)
+                .setKeywordsFile(new File(folder,"keywords.txt").getAbsolutePath())
+                .setMaxActivePaths(4).setKeywordsScore(1.0f)
+                .setKeywordsThreshold(0.40f).setNumTrailingBlanks(1).build();
+            kws=new KeywordSpotter(k);
+            stream=kws.createStream();
+        }else{
+            kws=null;stream=null; // no Zipformer model or decoding objects allocated
+        }
         SileroVadModelConfig s=SileroVadModelConfig.builder()
             .setModel(new File(folder,"silero_vad.onnx").getAbsolutePath())
             .setThreshold(0.52f).setMinSpeechDuration(0.18f)
@@ -111,6 +117,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
     public List<Clip> accept(short[] pcm,int length){
         float[] audio=new float[length];
         for(int i=0;i<length;i++)audio[i]=pcm[i]/32768f;
+        if(kws!=null){
         stream.acceptWaveform(audio,16000);
         int iterations=0;
         while(kws.isReady(stream) && iterations++<40){
@@ -123,6 +130,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
                 // hit. The VAD segment is maintained separately.
                 kws.reset(stream);
             }
+        }
         }
         for(float f:audio){
             vadWindow[windowFill++]=f;
@@ -142,7 +150,7 @@ public final class SherpaVoiceEngine implements AutoCloseable {
                         completed.add(new Clip(out,keyword,conflict));
                     }
                     keyword="";conflict=false;
-                    kws.reset(stream);
+                    if(kws!=null)kws.reset(stream);
                 }
             }
         }
@@ -152,9 +160,14 @@ public final class SherpaVoiceEngine implements AutoCloseable {
     }
     /** Must discard unfinished utterance across a training/enrollment mode change. */
     public void reset(){
-        kws.reset(stream);vad.reset();keyword="";conflict=false;windowFill=0;completed.clear();
+        if(kws!=null)kws.reset(stream);vad.reset();keyword="";conflict=false;windowFill=0;completed.clear();
     }
     @Override public void close(){
-        try{stream.release();}finally{try{kws.release();}finally{try{vad.release();}finally{if(speaker!=null)speaker.release();}}}
+        try{
+            if(stream!=null)stream.release();
+        }finally{
+            try{if(kws!=null)kws.release();}
+            finally{try{vad.release();}finally{if(speaker!=null)speaker.release();}}
+        }
     }
 }

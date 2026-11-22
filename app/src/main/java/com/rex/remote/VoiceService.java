@@ -30,7 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * REx v1.4: KWS + VAD + frozen openWakeWord features + trained personal MLP head,
+ * REx v1.5: VAD-only sherpa + separate TFLite worker + personal MLP head,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
  * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
  */
@@ -85,11 +85,8 @@ public final class VoiceService extends Service {
     private static final String CHANNEL="rex_offline_voice_v7"; // preserve notification channel
     private static final String TAG="RExOfflineVoice";
     private static final int SAMPLE_RATE=16000;
-    // Set false to use only the previously working sherpa KWS/VAD pipeline.
-    // Diagnostic switch for native ONNX crashes; it does not erase trained samples.
-    private static final boolean ENABLE_PERSONAL_NEURAL=true;
-    private static final String SHERPA_MODEL_ZIP="rex-sherpa-kws-zh-en-v1.zip";
-    private static final String SHERPA_MODEL_FOLDER="rex-sherpa-kws-zh-en-v1";
+    private static final String SHERPA_MODEL_ZIP="rex-sherpa-vad-campplus-v15.zip";
+    private static final String SHERPA_MODEL_FOLDER="rex-sherpa-vad-campplus-v15";
     // Observation-only state: diagnostics cannot authorize speech commands.
     private final VoiceDiagnostics diagnostics=new VoiceDiagnostics();
     private final ArrayBlockingQueue<AudioFrame> audioFrames=new ArrayBlockingQueue<>(16);
@@ -101,7 +98,9 @@ public final class VoiceService extends Service {
     private volatile String status="语音未启动";
     private volatile String ownerStatus="尚未录入声纹";
     private volatile AudioRecord recording;
-    private Thread worker;
+    private Thread worker,neuralWorker;
+    private final ArrayBlockingQueue<NeuralClip> neuralClips=new ArrayBlockingQueue<>(4);
+    private final StreamingPcmCache pcmCache=new StreamingPcmCache(48000,2560);
     private SpeakerProfile profile;
     private CommandTemplateStore templates; // old MFCC data retained
     private PersonalNeuralStore neural;
@@ -277,7 +276,7 @@ public final class VoiceService extends Service {
         try {startForeground(1001,notification,ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);}
         catch(Exception e){status="麦克风服务启动失败："+e.getClass().getSimpleName();
             publish(null,null,null,false,0f);stopSelf();return START_NOT_STICKY;}
-        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-sherpa-voice-v12");worker.start();}
+        if(!running){running=true;worker=new Thread(this::recognitionLoop,"rex-v15-vad");worker.start();}
         publish(null,null,null,false,0f);
         return START_NOT_STICKY;
     }
@@ -324,12 +323,12 @@ public final class VoiceService extends Service {
            clip.generation!=captureGeneration)return;
         // Exact-transcript gating rejected the owner's accent. A
         // The chosen phrase supplies the positive/negative supervised label.
-        // The learned head may later complement missing KWS evidence, but all
-        // outcomes still require the VAD segment and fusion policy.
+        // Each tagged sample trains the MLP and also supports template matching;
+        // VAD is required before any training data is committed.
         long measureStarted=SystemClock.elapsedRealtime();
         float[] vector=features==null?null:features.embed(clip.pcm);
         String failure=features==null?
-            "个人神经模型不可用；基础关键词监听继续运行":neural.add(clip.phrase,vector);
+            "个人特征模型不可用；请检查TFLite文件":neural.add(clip.phrase,vector);
         if(failure!=null){
             diagnostics.onPersonal("训练失败："+failure);
             diagnostics.onVerdict("训练未保存",failure,
@@ -352,16 +351,13 @@ public final class VoiceService extends Service {
     private File unpackSherpaModel() throws Exception {
         File root=new File(getFilesDir(),"rex_offline_models");
         File folder=new File(root,SHERPA_MODEL_FOLDER);
-        File marker=new File(folder,".rex_sherpa_ready_v11");
-        String[] files={"encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
-            "decoder-epoch-13-avg-2-chunk-16-left-64.onnx",
-            "joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
-            "tokens.txt","keywords.txt","silero_vad.onnx","campplus_zh_en.onnx"};
+        File marker=new File(folder,".rex_sherpa_ready_v15");
+        String[] files={"silero_vad.onnx","campplus_zh_en.onnx"};
         boolean valid=marker.isFile();
         for(String f:files)valid &= new File(folder,f).length()>100;
         if(valid)return folder;
         if(!root.exists() && !root.mkdirs())throw new IllegalStateException("无法创建模型目录");
-        updateStatus("首次启动 · 解压关键词、VAD 与独立声纹模型…");
+        updateStatus("首次启动 · 只解压 Silero VAD 与 CAM++ 声纹模型…");
         long expanded=0;int count=0;
         String rootPath=root.getCanonicalPath()+File.separator;
         try(InputStream in=getAssets().open(SHERPA_MODEL_ZIP);
@@ -401,23 +397,17 @@ public final class VoiceService extends Service {
         final short[] samples;final long generation;
         AudioFrame(short[] samples,long generation){this.samples=samples;this.generation=generation;}
     }
-    /** VAD already delivered a real speech segment. Zipformer has been running
-     * concurrently for low latency; neither a background KWS hit nor a loud
-     * noise by itself can bypass this final speech-segment gate. */
+    /** Runs ONLY on the dedicated TFLite thread, never the VAD or microphone thread.
+     * Still uses the exact original full-clip embedding to keep saved 30-take
+     * samples and trained heads compatible. This is NOT incremental Mel inference. */
     private void recognizeSherpaClip(SherpaVoiceEngine.Clip clip,long generation,
-                                      SherpaVoiceEngine engine,OpenWakeWordFeatures features){
+                                      OpenWakeWordFeatures features,long queuedAt){
         if(generation!=captureGeneration)return;
         if(trainingMode){
             if(trainingArmed && SystemClock.elapsedRealtime()<=trainingDeadline){
                 trainingArmed=false;
                 handleTrainingClip(new CommandClip(clip.pcm,trainingPhrase,generation),features);
             }
-            return;
-        }
-        if(profile.isEnrolling()){
-            if(!enrollArmed)return;
-            float[] speaker=engine.speakerEmbedding(clip.pcm);
-            if(generation==captureGeneration)consumeEnrollment(speaker);
             return;
         }
         long now=SystemClock.elapsedRealtime();
@@ -428,42 +418,28 @@ public final class VoiceService extends Service {
         }
         long personalStarted=SystemClock.elapsedRealtime();
         float[] utteranceFeature=trained && features!=null?features.embed(clip.pcm):null;
-        PersonalNeuralStore.Result oldMatch=utteranceFeature==null?null:neural.evaluate(utteranceFeature);
-        PersonalWakeHead.Result headMatch=utteranceFeature==null?null:trainedHead.evaluate(utteranceFeature);
-        PersonalNeuralStore.Result match=oldMatch;
-        // Trained head takes precedence only when it has genuinely learned
-        // positive-vs-negative discrimination. The old classifier is fallback.
-        if(headMatch!=null && headMatch.accepted &&
-           (oldMatch==null || !oldMatch.accepted ||
-            headMatch.phrase==oldMatch.phrase ||
-            (headMatch.score>=.95f && headMatch.second<=.35f))){
-            match=new PersonalNeuralStore.Result(headMatch.phrase,headMatch.runnerUp,
-                headMatch.score,headMatch.second,.64f,headMatch.trainedCount,true,
-                "v1.4 监督训练 MLP 分类头（非声纹认证）");
-        }
-        if(headMatch!=null){
-            diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
-                "v1.4分类头 p=%d 得分 %.3f 备选 %.3f · %s · %s",
-                headMatch.phrase,headMatch.score,headMatch.second,
-                headMatch.reason,match==oldMatch?"沿用原匹配":"采用训练分类头"));
-        }
-        CommandFusion.Config cfg=CommandFusion.load(this);
-        if(match==null){
-            diagnostics.onPersonal(!trained?"未启用：没有达到6条的个人训练口令":
-                features==null?"不可用：个人TFLite模型未加载":"个人语音没有可用的模型得分");
-        }else{
-            diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
-                "个人得分 %.3f / 可调门槛 %.3f / 内部门槛 %.3f · %d条 · %dms (%s)",
-                match.score,cfg.neuralThreshold,match.threshold,match.samples,
-                SystemClock.elapsedRealtime()-personalStarted,match.reason));
-        }
-        // The stock sherpa JNI does not expose a continuous KWS probability.
-        // Its evidence is exactly 1 for a hit and 0 for no hit, NOT a confidence.
-        CommandFusion.Decision decision=CommandFusion.evaluate(
-            clip.keyword,awake,clip.conflictingKeywords,match,cfg);
-        diagnostics.onPersonal(decision.report(cfg));
+        long embedMs=SystemClock.elapsedRealtime()-personalStarted;
+        long templateStart=SystemClock.elapsedRealtime();
+        PersonalNeuralStore.Result template=utteranceFeature==null?null:neural.evaluate(utteranceFeature);
+        long templateMs=SystemClock.elapsedRealtime()-templateStart;
+        long headStart=SystemClock.elapsedRealtime();
+        // Template accepted -> evaluate only corresponding MLP. Otherwise scan
+        // all trained heads, so a missed template cannot block a valid phrase.
+        PersonalWakeHead.Result head=utteranceFeature==null?null:
+            (template!=null&&template.accepted?
+                trainedHead.evaluatePhrase(utteranceFeature,template.phrase):
+                trainedHead.evaluate(utteranceFeature));
+        long headMs=SystemClock.elapsedRealtime()-headStart;
+        NeuralFusion.Config cfg=NeuralFusion.load(this);
+        NeuralFusion.Decision decision=NeuralFusion.evaluate(awake,template,head,cfg);
+        long queueMs=SystemClock.elapsedRealtime()-queuedAt;
+        diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
+            "v1.5 模板 %s / MLP %s · 特征 %dms 模板 %dms MLP %dms · 排队及处理 %dms · %s",
+            template==null?"无":String.format(java.util.Locale.ROOT,"%.3f(%s)",template.score,template.accepted?"有效":"未通过"),
+            head==null?"未训练":String.format(java.util.Locale.ROOT,"%.3f(%s)",head.score,head.accepted?"有效":"未通过"),
+            embedMs,templateMs,headMs,queueMs,decision.report(cfg)));
+        // No KWS evidence exists in v1.5; VAD+personal networks only.
         if(!decision.pass){
-            if(!clip.keyword.isEmpty())neuralWake.clear();
             diagnostics.onVerdict("融合拒绝",decision.report(cfg),
                 SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
             status="本句未通过综合评分 · "+decision.reason;
@@ -473,7 +449,7 @@ public final class VoiceService extends Service {
         if(decision.wake)neuralWake.clear();
         RexCommand command=decision.command;
         boolean wake=decision.wake;
-        String signature=String.valueOf(command)+"|"+wake+"|"+clip.keyword;
+        String signature=String.valueOf(command)+"|"+wake;
         if(signature.equals(lastFinalSignature)&&now-lastFinalMs<750){
             diagnostics.onVerdict("重复结果已抑制","750ms内相同候选被去重",
                 SystemClock.elapsedRealtime(),SystemClock.elapsedRealtime()-decisionStarted);
@@ -484,10 +460,10 @@ public final class VoiceService extends Service {
         if(command==RexCommand.SLEEP){awake=false;lastOwnerVerifiedMs=0;}
         ownerStatus="个人神经模型辅助口令（非本人认证）· CAM++ 仅在声纹页";
         if(wake)status="REx 已唤醒 · 综合得分 " +
-            String.format(java.util.Locale.ROOT,"%.3f",decision.combined);
+            String.format(java.util.Locale.ROOT,"%.3f",decision.total);
         else if(command==RexCommand.SLEEP)status="已睡眠";
         else status="识别『"+command.label+"』· 综合得分 "+
-            String.format(java.util.Locale.ROOT,"%.3f",decision.combined)+
+            String.format(java.util.Locale.ROOT,"%.3f",decision.total)+
             " · 仅预览，不发送红外";
         diagnostics.onVerdict(wake?"唤醒成功":command==RexCommand.SLEEP?
                 "进入待机":"识别成功："+command.label,
@@ -495,25 +471,72 @@ public final class VoiceService extends Service {
             SystemClock.elapsedRealtime()-decisionStarted);
         publish(decision.report(cfg),null,command,wake,0f);
     }
+    private static final class NeuralClip {
+        final SherpaVoiceEngine.Clip clip;
+        final long generation,queuedAt;
+        NeuralClip(SherpaVoiceEngine.Clip c,long g,long time){clip=c;generation=g;queuedAt=time;}
+    }
+    /** Dedicated inference thread owns the ONE TFLite frontend. Never call its
+     * Interpreter from VAD, microphone or background trainer threads. */
+    private void neuralLoop(){
+        OpenWakeWordFeatures features=null;
+        boolean unavailable=false;
+        try{
+            while(running){
+                NeuralClip item=neuralClips.poll(200,TimeUnit.MILLISECONDS);
+                if(item==null||!running)continue;
+                if(item.generation!=captureGeneration)continue;
+                boolean need=trainingMode;
+                if(!need){
+                    for(int i=0;i<CommandPhrases.count();i++){
+                        if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES || trainedHead.hasModel(i)){
+                            need=true;break;
+                        }
+                    }
+                }
+                if(need&&features==null&&!unavailable){
+                    try{
+                        features=new OpenWakeWordFeatures(this);
+                        Log.i(TAG,"v1.5 TFLite frontend loaded on separate inference thread");
+                    }catch(Exception | LinkageError e){
+                        unavailable=true;
+                        diagnostics.onError("TFLite特征初始化",e.getClass().getSimpleName());
+                        Log.e(TAG,"Personal TFLite unavailable",e);
+                    }
+                }
+                if(item.generation!=captureGeneration)continue;
+                try{
+                    recognizeSherpaClip(item.clip,item.generation,features,item.queuedAt);
+                }catch(RuntimeException e){
+                    diagnostics.onError("神经识别",e.getClass().getSimpleName());
+                    Log.e(TAG,"One neural clip failed",e);
+                    status="神经单段识别失败，监听仍继续";
+                    publish(null,null,null,false,0f);
+                }
+            }
+        }catch(InterruptedException ignored){
+            Thread.currentThread().interrupt();
+        }finally{
+            if(features!=null)try{features.close();}
+            catch(Exception e){Log.w(TAG,"TFLite cleanup error",e);}
+        }
+    }
+    /** Silero VAD runs independently of the slower frozen TFLite frontend.
+     * Zipformer is NOT initialized; previously downloaded KWS assets can stay
+     * on disk, but consume no KWS inference CPU or memory. */
     private void recognitionLoop(){
         try{
-            diagnostics.onEngine("正在准备模型文件");
-            File kwsDir=unpackSherpaModel();
+            diagnostics.onEngine("准备 Silero VAD / CAM++ 文件，不加载Zipformer");
+            File modelDir=unpackSherpaModel();
             if(!running)return;
-            updateStatus("启动 Zipformer KWS + Silero VAD + openWakeWord 个人神经模型…");
-            // The personal ONNX frontend is optional and loaded only on first use.
-            // A missing/broken personal model must not terminate the primary KWS.
-            OpenWakeWordFeatures personalFeatures=null;
-            boolean personalUnavailable=false;
-            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(kwsDir,
+            updateStatus("启动 Silero VAD + 独立个人神经推理线程…");
+            try(SherpaVoiceEngine engine=new SherpaVoiceEngine(modelDir,
                 new SherpaVoiceEngine.DiagnosticsListener(){
-                    @Override public void onKwsHit(String hit,boolean conflict){
-                        diagnostics.onKeyword(hit,conflict,SystemClock.elapsedRealtime());
+                    @Override public void onKwsHit(String unused,boolean conflict){}
+                    @Override public void onVadSegment(int samples,boolean accepted,String unused){
+                        diagnostics.onVad(samples,accepted,"",SystemClock.elapsedRealtime());
                     }
-                    @Override public void onVadSegment(int samples,boolean accepted,String keyword){
-                        diagnostics.onVad(samples,accepted,keyword,SystemClock.elapsedRealtime());
-                    }
-                })){
+                },false)){
                 int minimum=AudioRecord.getMinBufferSize(SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
                 if(minimum<=0)throw new IllegalStateException("不支持16kHz麦克风");
@@ -522,62 +545,51 @@ public final class VoiceService extends Service {
                     Math.max(minimum*2,8192));
                 recording=mic;
                 if(mic.getState()!=AudioRecord.STATE_INITIALIZED)
-                    throw new IllegalStateException("AudioRecord 未能初始化");
+                    throw new IllegalStateException("AudioRecord 未初始化");
                 NoiseSuppressor ns=null;AutomaticGainControl agc=null;
                 try{
                     try{if(NoiseSuppressor.isAvailable()){
                         ns=NoiseSuppressor.create(mic.getAudioSessionId());
                         if(ns!=null)ns.setEnabled(true);
-                    }}catch(Exception ex){Log.w(TAG,"NoiseSuppressor unavailable",ex);}
+                    }}catch(Exception e){Log.w(TAG,"NoiseSuppressor unavailable",e);}
                     try{if(AutomaticGainControl.isAvailable()){
                         agc=AutomaticGainControl.create(mic.getAudioSessionId());
                         if(agc!=null)agc.setEnabled(true);
-                    }}catch(Exception ex){Log.w(TAG,"AGC unavailable",ex);}
+                    }}catch(Exception e){Log.w(TAG,"AGC unavailable",e);}
                     mic.startRecording();
-                    diagnostics.onEngine("麦克风已启动，KWS/VAD运行中");
-                    updateStatus("流式监听 · KWS + VAD + 个人神经口令 · 仅预览");
-                    Thread capture=new Thread(()->capturePcm(mic),"rex-live-mic-v12");
+                    diagnostics.onEngine("VAD线程与神经线程分离 · KWS关闭 · 160ms滚动PCM缓存");
+                    updateStatus("神经匹配 + 监督MLP · VAD并行 · KWS已关闭 · 仅预览");
+                    neuralWorker=new Thread(this::neuralLoop,"rex-v15-neural-tflite");
+                    neuralWorker.start();
+                    Thread capture=new Thread(()->capturePcm(mic),"rex-v15-live-mic");
                     capture.start();
                     long previousGeneration=-1;
                     while(running){
-                        AudioFrame packet=audioFrames.poll(220,TimeUnit.MILLISECONDS);
+                        AudioFrame packet=audioFrames.poll(200,TimeUnit.MILLISECONDS);
                         if(packet==null||!running)continue;
                         long gen=captureGeneration;
                         if(packet.generation!=gen)continue;
-                        if(previousGeneration!=gen || droppedAudio){
-                            engine.reset();previousGeneration=gen;
-                            droppedAudio=false;
+                        if(previousGeneration!=gen||droppedAudio){
+                            engine.reset();previousGeneration=gen;droppedAudio=false;
+                            neuralClips.clear();
                         }
                         for(SherpaVoiceEngine.Clip clip:engine.accept(packet.samples,packet.samples.length)){
                             if(gen!=captureGeneration)break;
-                            boolean needPersonal=ENABLE_PERSONAL_NEURAL && trainingMode;
-                            if(ENABLE_PERSONAL_NEURAL && !needPersonal && !profile.isEnrolling()){
-                                for(int i=0;i<CommandPhrases.count();i++){
-                                    if(neural.count(i)>=PersonalNeuralStore.MIN_TAKES){
-                                        needPersonal=true;break;
+                            if(profile.isEnrolling()){
+                                if(enrollArmed){
+                                    try{consumeEnrollment(engine.speakerEmbedding(clip.pcm));}
+                                    catch(RuntimeException e){
+                                        diagnostics.onError("CAM++声纹",e.getClass().getSimpleName());
                                     }
                                 }
+                                continue;
                             }
-                            if(needPersonal && personalFeatures==null && !personalUnavailable){
-                                try{
-                                    personalFeatures=new OpenWakeWordFeatures(this);
-                                    Log.i(TAG,"Personal neural frontend loaded on demand");
-                                }catch(Exception | LinkageError ex){
-                                    personalUnavailable=true;
-                                    diagnostics.onPersonal("个人神经模型加载失败："+ex.getClass().getSimpleName());
-                                    diagnostics.onError("TFLite初始化",ex.getClass().getSimpleName());
-                                    Log.e(TAG,"Optional personal ONNX frontend unavailable; KWS continues",ex);
-                                    status="个人模型暂不可用；基础关键词识别继续运行";
-                                    publish(null,null,null,false,0f);
-                                }
-                            }
-                            try{
-                                recognizeSherpaClip(clip,gen,engine,personalFeatures);
-                            }catch(RuntimeException ex){
-                                diagnostics.onError("单段裁决",ex.getClass().getSimpleName());
-                                Log.e(TAG,"One voice clip failed; continuous KWS kept alive",ex);
-                                status="单条语音处理出错，已跳过并继续监听";
-                                publish(null,null,null,false,0f);
+                            NeuralClip item=new NeuralClip(clip,gen,SystemClock.elapsedRealtime());
+                            if(!neuralClips.offer(item)){
+                                neuralClips.clear();
+                                diagnostics.onDroppedAudio();
+                                diagnostics.onPersonal("神经队列拥堵：抛弃过期片段，保留最新一段");
+                                neuralClips.offer(item);
                             }
                         }
                     }
@@ -586,19 +598,20 @@ public final class VoiceService extends Service {
                     if(ns!=null)ns.release();if(agc!=null)agc.release();
                     mic.release();recording=null;
                 }
-            }finally{
-                if(personalFeatures!=null)try{personalFeatures.close();}
-                catch(Exception ex){Log.w(TAG,"Optional neural feature cleanup failed",ex);}
             }
-        }catch(Exception ex){
+        }catch(InterruptedException ignored){
+            Thread.currentThread().interrupt();
+        }catch(Exception e){
             if(running){
-                diagnostics.onError("音频主引擎",ex.getClass().getSimpleName());
-                diagnostics.onEngine("已停止："+ex.getClass().getSimpleName());
-                Log.e(TAG,"REx KWS/openWakeWord audio pipeline failed",ex);
-                status="神经识别启动失败："+ex.getClass().getSimpleName()+" "+String.valueOf(ex.getMessage());
+                diagnostics.onError("VAD音频线程",e.getClass().getSimpleName());
+                diagnostics.onEngine("已停止："+e.getClass().getSimpleName());
+                Log.e(TAG,"v1.5 VAD audio pipeline failed",e);
+                status="VAD监听启动失败："+e.getClass().getSimpleName()+" "+e.getMessage();
                 publish(null,null,null,false,0f);
                 running=false;stopSelf();
             }
+        }finally{
+            if(neuralWorker!=null)neuralWorker.interrupt();
         }
     }
     /** Microphone PCM runs separately; bounded queue drops stale data instead of lagging. */
@@ -624,6 +637,8 @@ public final class VoiceService extends Service {
                         publishEnrollment("CAPTURE_FAIL");
                     }
                 }
+                int hops=pcmCache.add(reusable,n,captureGeneration);
+                if(hops>0)diagnostics.onStreamHop(pcmCache.hops(),pcmCache.available(),now);
                 short[] copy=java.util.Arrays.copyOf(reusable,n);
                 AudioFrame frame=new AudioFrame(copy,captureGeneration);
                 if(!audioFrames.offer(frame)){
@@ -725,6 +740,8 @@ public final class VoiceService extends Service {
         AudioRecord mic=recording;
         if(mic!=null)try{mic.stop();}catch(Exception ignored){}
         if(worker!=null)worker.interrupt();
+        if(neuralWorker!=null)neuralWorker.interrupt();
+        neuralClips.clear();
         trainingRevision.incrementAndGet();
         trainingWorker.shutdownNow();
         if(profile!=null)profile.abandon();

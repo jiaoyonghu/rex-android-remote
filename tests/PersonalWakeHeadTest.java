@@ -30,6 +30,11 @@ public final class PersonalWakeHeadTest {
         check(report.startsWith("训练成功"),"learned model must converge");
         check(heads.hasModel(0) && heads.trainedCount()==1,"trained head persisted");
         var positive=heads.evaluate(jitter(wake,987,.17f));
+        var targeted=heads.evaluatePhrase(jitter(wake,987,.17f),0);
+        check(targeted!=null && targeted.accepted && targeted.phrase==0,
+            "v1.5 targeted one-head inference works after template hit");
+        check(heads.evaluatePhrase(jitter(wake,987,.17f),6)==null,
+            "untrained phrase is not guessed by a different head");
         var negative=heads.evaluate(jitter(ambient,988,.17f));
         check(positive!=null && positive.accepted && positive.phrase==0,
             "held-out positive detected: "+(positive==null?"null":positive.score));

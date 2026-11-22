@@ -9,11 +9,11 @@ export LC_ALL=C.UTF-8
 src_classes=(RexCommand CommandPhrases CommandAcoustics CommandAudioSegmenter
  CommandActivityGate BilingualCommandRouter EnrollmentPrompts SpeakerMath
  SpeakerProfile SpeechActivityGate CommandTemplateStore VoskGrammar SpeechFusion
- SherpaCommandPolicy VoiceIdentityPolicy PersonalWakePolicy PersonalNeuralStore NeuralWakePolicy VoiceDiagnostics CommandFusion PersonalWakeHead)
+ SherpaCommandPolicy VoiceIdentityPolicy PersonalWakePolicy PersonalNeuralStore NeuralWakePolicy VoiceDiagnostics CommandFusion PersonalWakeHead NeuralFusion StreamingPcmCache)
 test_classes=(CommandActivityGateTest CommandTest CommandAcousticsTest
  CommandTemplateStoreTest EnrollmentTest SpeakerMathTest SpeechGateTest
  SpeechFusionTest SpeakerProfileTest FarFieldAcousticsTest
- SherpaCommandPolicyTest VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest VoiceDiagnosticsTest CommandFusionTest PersonalWakeHeadTest)
+ SherpaCommandPolicyTest VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest VoiceDiagnosticsTest CommandFusionTest PersonalWakeHeadTest NeuralFusionTest StreamingPcmCacheTest)
 stubs=(android/content/Context.java android/content/SharedPreferences.java
  android/util/Base64.java org/json/JSONArray.java org/json/JSONException.java)
 missing=()
@@ -50,7 +50,7 @@ for test in CommandActivityGateTest CommandTest EnrollmentTest SpeakerMathTest S
 done
 for test in CommandAcousticsTest CommandTemplateStoreTest SpeechFusionTest \
  SpeakerProfileTest FarFieldAcousticsTest SherpaCommandPolicyTest \
- VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest VoiceDiagnosticsTest CommandFusionTest PersonalWakeHeadTest; do
+ VoiceIdentityPolicyTest PersonalWakePolicyTest PersonalNeuralStoreTest VoiceDiagnosticsTest CommandFusionTest PersonalWakeHeadTest NeuralFusionTest StreamingPcmCacheTest; do
   java -cp "$out" "com.rex.remote.$test"
 done
-printf 'REX diagnostics: all 17 offline Java regression tests PASSED\n'
+printf 'REX v1.5: all 19 offline Java regression suites PASSED\n'

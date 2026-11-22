@@ -171,6 +171,20 @@ public final class PersonalWakeHead {
             "；训练均值 "+String.format(Locale.ROOT,"%.2f/%.2f",posMean,negMean)+
             "（非独立验证准确率）";
     }
+    /** Fast path: template supplies a phrase, so score ONLY its matching MLP.
+     * No separate TFLite interpreter is created; weights are plain Java arrays.
+     * In the absence of competing heads this is a one-vs-rest binary score.
+     */
+    public synchronized Result evaluatePhrase(float[] raw,int phrase){
+        if(phrase<0||phrase>=CommandPhrases.count())return null;
+        float[] x=PersonalNeuralStore.unit(raw);
+        if(x==null)return null;
+        Model m=load(phrase);if(m==null)return null;
+        float score=m.predict(x);
+        boolean pass=score>=.64f;
+        return new Result(phrase,-1,m.positives,score,0f,pass,
+            pass?"候选MLP已训练并通过内部门槛":"候选MLP分数低于内部0.64门槛");
+    }
     public synchronized Result evaluate(float[] raw){
         float[] x=PersonalNeuralStore.unit(raw);
         if(x==null)return null;

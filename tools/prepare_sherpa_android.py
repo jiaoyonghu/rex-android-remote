@@ -1,177 +1,71 @@
 #!/usr/bin/env python3
-"""GitHub Actions: pin sherpa-onnx 2.0.2 Java/JNI, KWS, VAD and CAM++ speaker.
+"""GitHub Actions: download pinned sherpa-onnx JNI, Silero VAD and CAM++ only.
 
-Never uploads or modifies a user's audio, templates or model preferences.
-This runs on the BUILD RUNNER before Gradle, not on the phone.
+REx v1.5 removes Zipformer KWS model downloads and keywords generation.
+This BUILD-TIME script never reads or uploads user microphone recordings.
 """
 import hashlib
 import io
 from pathlib import Path
-import re
-import tarfile
 import urllib.request
 import zipfile
 
-ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ROOT/'app/src/main/assets'
-LIB = ROOT/'app/libs'
-NATIVE = ROOT/'app/src/main/jniLibs/arm64-v8a'
-BASE = 'https://github.com/k2-fsa/sherpa-onnx/releases/download'
-VERS = '2.0.2'
-MODEL = 'sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20'
-MODEL_DIR = 'rex-sherpa-kws-zh-en-v1'
+ROOT=Path(__file__).resolve().parents[1]
+ASSETS=ROOT/'app/src/main/assets'
+LIB=ROOT/'app/libs'
+NATIVE=ROOT/'app/src/main/jniLibs/arm64-v8a'
+BASE='https://github.com/k2-fsa/sherpa-onnx/releases/download'
+VERS='2.0.2'
+MODEL_DIR='rex-sherpa-vad-campplus-v15'
 
 
-def download(url, max_bytes):
-    print('Downloading', url, flush=True)
-    req = urllib.request.Request(url, headers={'User-Agent':'REX-Android-build/1.0'})
-    with urllib.request.urlopen(req, timeout=180) as r:
-        out=io.BytesIO()
+def download(url,limit):
+    print('Downloading',url,flush=True)
+    request=urllib.request.Request(url,headers={'User-Agent':'REx-Android-build/1.5'})
+    with urllib.request.urlopen(request,timeout=180) as reply:
+        chunks=io.BytesIO()
         while True:
-            data=r.read(65536)
-            if not data: break
-            out.write(data)
-            if out.tell()>max_bytes: raise RuntimeError('Download exceeds permitted size')
-        return out.getvalue()
+            data=reply.read(65536)
+            if not data:break
+            chunks.write(data)
+            if chunks.tell()>limit:raise RuntimeError('Download exceeds limit')
+        return chunks.getvalue()
 
 
-def sha256(raw, expected):
+def sha256(raw,expected):
     actual=hashlib.sha256(raw).hexdigest()
-    if actual!=expected: raise RuntimeError('Checksum mismatch, refuse model/runtime: '+actual)
-
-
-def words_from_source():
-    txt=(ROOT/'app/src/main/java/com/rex/remote/CommandPhrases.java').read_text()
-    block=txt.split('public static final String[] ALL',1)[1].split('};',1)[0]
-    labels=re.findall(r'"([^"\n]+)"',block)
-    if len(labels)!=25: raise RuntimeError('Unexpected command list; refuse partial keywords')
-    return labels
-
-
-def split_chinese_syllable(syllable, valid, label, han):
-    """Convert one CONTEXTUAL pinyin syllable to model initial + toned final.
-
-    pypinyin Style.FINALS_TONE expands 'shui4' into 'ueì' on some versions,
-    while this Sherpa KWS model expects 'sh uì'.  Splitting the actual
-    toned full syllable produces model-compatible contracted finals.
-    """
-    import unicodedata
-    syllable=unicodedata.normalize('NFC', syllable.lower())
-    initials=('zh','ch','sh','b','p','m','f','d','t','n','l','g','k',
-              'h','j','q','x','r','z','c','s','y','w')
-    for initial in initials:
-        if syllable.startswith(initial):
-            final=syllable[len(initial):]
-            if initial in valid and final in valid:
-                return [initial, final]
-    if syllable in valid:
-        return [syllable]  # e.g., ài, ér: zero initial
-    raise RuntimeError(
-        f'Keyword {label!r}: cannot encode character {han!r} '
-        f'(pinyin={syllable!r}) using this KWS model tokens.txt')
-
-
-def make_keywords(tokens, lexicon):
-    # Sherpa bilingual KWS uses Mandarin initial + toned final tokens and
-    # English ARPABET phones.  Every emitted token must exist in tokens.txt.
-    from pypinyin import pinyin, Style
-    valid={line.split()[0] for line in tokens.decode('utf-8-sig').splitlines()
-           if line.strip()}
-    phones={}
-    for line in lexicon.decode('utf-8',errors='replace').splitlines():
-        parts=line.split()
-        if len(parts)>1: phones.setdefault(parts[0].upper(),parts[1:])
-    phones.update({'REX':['R','EH1','K','S'],
-                   'ACTIVE':['AE1','K','T','IH0','V'],
-                   'DISABLE':['D','IH0','S','EY1','B','AH0','L'],
-                   'TURN':['T','ER1','N'],
-                   'AROUND':['ER0','AW1','N','D']})
-    out=[]
-    for label in words_from_source():
-        cleaned=re.sub(r'[，。！,!?？]', '', label)
-        # IMPORTANT: retain entire Chinese phrases for polyphonic characters.
-        # pinyin('睡觉') -> shuì jiào, but pinyin('觉') alone -> jué.
-        chunks=re.findall(r'[A-Za-z]+|[\u4e00-\u9fff]+',cleaned)
-        result=[]
-        for chunk in chunks:
-            if re.fullmatch('[A-Za-z]+',chunk):
-                if chunk.upper() not in phones:
-                    raise RuntimeError('Missing English pronunciation: '+chunk)
-                result.extend(phones[chunk.upper()])
-            else:
-                syllables=pinyin(chunk,style=Style.TONE,heteronym=False)
-                if len(syllables)!=len(chunk):
-                    raise RuntimeError(f'Invalid Chinese word alignment: {chunk!r}')
-                for han, syllable_list in zip(chunk,syllables):
-                    if not syllable_list:
-                        raise RuntimeError(f'No pinyin for {han!r} in {label!r}')
-                    result.extend(split_chinese_syllable(
-                        syllable_list[0],valid,label,han))
-        absent=[p for p in result if p not in valid]
-        if absent: raise RuntimeError(f'Keyword {label!r} has unsupported phones: {absent}')
-        if not result: raise RuntimeError('Empty keyword: '+label)
-        if label=='睡觉' and result!=['sh','uì','j','iào']:
-            raise RuntimeError('Contextual pronunciation for 睡觉 is incorrect: '+str(result))
-        # Longer wake phrases get an independent moderate sensitivity setting;
-        # single-syllable Rex stays conservative to avoid false activations.
-        if label in ('Rex醒了吗','灭建国'): args=' :1.2 #0.32'
-        elif label=='Rex': args=' :1.0 #0.40'
-        else: args=' :1.0 #0.40'
-        out.append(' '.join(result)+args+' @'+label.replace(' ','_'))
-    print('Prepared',len(out),'distinct exact command phrases, all tokens verified', flush=True)
-    return ('\n'.join(out)+'\n').encode('utf-8')
+    if actual!=expected:raise RuntimeError('Unexpected model/JNI checksum '+actual)
 
 
 def main():
-    LIB.mkdir(parents=True,exist_ok=True)
-    NATIVE.mkdir(parents=True,exist_ok=True)
-    ASSETS.mkdir(parents=True,exist_ok=True)
-    jarname=f'sherpa-onnx-jvm-{VERS}.jar'
-    raw=download(f'{BASE}/v{VERS}/{jarname}', 5_000_000)
-    sha256(raw,'ebde5706d720a27407ae7277749a3ed18abcbcb16d80d3d4ef54059a62cb06d2')
-    (LIB/jarname).write_bytes(raw)
-    raw=download(f'{BASE}/v{VERS}/sherpa-onnx-{VERS}.aar', 90_000_000)
-    sha256(raw,'6420cfb86c2ef8462dadd77b2202b7430487bdfb2bc715e9ce2864871209a80e')
-    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        so_files=[name for name in archive.namelist()
-                  if name.startswith('jni/arm64-v8a/') and name.endswith('.so')]
-        for name in so_files:
-            (NATIVE/Path(name).name).write_bytes(archive.read(name))
-        if not any('libsherpa-onnx-jni.so' in name for name in so_files):
-            raise RuntimeError('Official Android AAR lacks required arm64 JNI')
-        print('Extracted official arm64 JNI libraries:',so_files)
-    raw=download(f'{BASE}/kws-models/{MODEL}.tar.bz2', 65_000_000)
-    desired=[
-        'encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx',
-        'decoder-epoch-13-avg-2-chunk-16-left-64.onnx',
-        'joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx',
-        'tokens.txt','en.phone',
-    ]
-    selected={}
-    with tarfile.open(fileobj=io.BytesIO(raw),mode='r:bz2') as archive:
-        for member in archive.getmembers():
-            if not member.isfile():continue
-            base=Path(member.name).name
-            if base in desired and member.name.startswith(MODEL+'/'):
-                if member.size>20_000_000: raise RuntimeError('Unexpected KWS model size')
-                selected[base]=archive.extractfile(member).read()
-    if set(selected)!=set(desired):
-        raise RuntimeError('Incomplete bilingual KWS archive: '+str(set(desired)-set(selected)))
-    selected['keywords.txt']=make_keywords(selected['tokens.txt'],selected['en.phone'])
-    del selected['en.phone']
-    silero=download(f'{BASE}/asr-models/silero_vad.onnx', 5_000_000)
-    if not 400_000<len(silero)<5_000_000:raise RuntimeError('Invalid Silero VAD model length')
-    selected['silero_vad.onnx']=silero
-    speaker_name='3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx'
-    speaker=download(f'https://huggingface.co/bitsydarel/campplus-onnx/resolve/main/{speaker_name}',35_000_000)
-    if len(speaker)!=28281164: raise RuntimeError('Unexpected CAM++ model size')
-    sha256(speaker,'aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2')
-    selected['campplus_zh_en.onnx']=speaker
-    target=ASSETS/(MODEL_DIR+'.zip')
-    with zipfile.ZipFile(target,'w',zipfile.ZIP_DEFLATED,compresslevel=7) as z:
-        for name,body in sorted(selected.items()):
-            z.writestr(MODEL_DIR+'/'+name,body)
-    print('Bundled neural KWS + VAD + CAM++ speaker model',target, target.stat().st_size,'bytes')
+    for directory in (LIB,NATIVE,ASSETS):directory.mkdir(parents=True,exist_ok=True)
+    jar=f'sherpa-onnx-jvm-{VERS}.jar'
+    data=download(f'{BASE}/v{VERS}/{jar}',5_000_000)
+    sha256(data,'ebde5706d720a27407ae7277749a3ed18abcbcb16d80d3d4ef54059a62cb06d2')
+    (LIB/jar).write_bytes(data)
+    data=download(f'{BASE}/v{VERS}/sherpa-onnx-{VERS}.aar',90_000_000)
+    sha256(data,'6420cfb86c2ef8462dadd77b2202b7430487bdfb2bc715e9ce2864871209a80e')
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        libs=[name for name in z.namelist()
+              if name.startswith('jni/arm64-v8a/') and name.endswith('.so')]
+        if not any('libsherpa-onnx-jni.so' in name for name in libs):
+            raise RuntimeError('Official sherpa AAR has no arm64 JNI')
+        for name in libs:(NATIVE/Path(name).name).write_bytes(z.read(name))
+        print('Official arm64 native libraries:',libs,flush=True)
 
+    vad=download(f'{BASE}/asr-models/silero_vad.onnx',5_000_000)
+    if not 400_000<len(vad)<5_000_000:raise RuntimeError('Silero model size invalid')
+    speaker_name='3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx'
+    campplus=download(
+        f'https://huggingface.co/bitsydarel/campplus-onnx/resolve/main/{speaker_name}',
+        35_000_000)
+    if len(campplus)!=28281164:raise RuntimeError('CAM++ unexpected model size')
+    sha256(campplus,'aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2')
+    asset=ASSETS/(MODEL_DIR+'.zip')
+    with zipfile.ZipFile(asset,'w',zipfile.ZIP_DEFLATED,compresslevel=7) as z:
+        z.writestr(MODEL_DIR+'/silero_vad.onnx',vad)
+        z.writestr(MODEL_DIR+'/campplus_zh_en.onnx',campplus)
+    print('VAD/CAM++ offline assets prepared WITHOUT Zipformer KWS:',asset,
+          asset.stat().st_size,flush=True)
 
 if __name__=='__main__':main()

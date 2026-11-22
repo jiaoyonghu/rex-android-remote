@@ -124,7 +124,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
     private void startVoice() {
         try {
             startForegroundService(new Intent(this,VoiceService.class));
-            view.setMessage("REx KWS + VAD + 声纹模型启动中 · 首次解压离线模型");
+            view.setMessage("REx VAD + 神经匹配 + MLP 启动中 · 已关闭Zipformer");
         } catch(Exception e) {
             view.setMessage("语音启动失败："+e.getClass().getSimpleName());
         }
@@ -217,12 +217,12 @@ public final class MainActivity extends Activity implements RexView.Actions {
             view.setMessage("诊断记录清理失败："+e.getClass().getSimpleName());
         }
     }
-    @Override public boolean onSaveFusionSettings(CommandFusion.Config settings){
+    @Override public boolean onSaveFusionSettings(NeuralFusion.Config settings){
         try{
-            boolean ok=CommandFusion.save(this,settings);
+            boolean ok=NeuralFusion.save(this,settings);
             if(ok){
                 Toast.makeText(this,"参数已保存；下一段语音开始使用新权重",Toast.LENGTH_SHORT).show();
-                view.setMessage("v1.3 · 已保存综合评分参数 · 仅语音预览");
+                view.setMessage("v1.5 · 已保存模板/MLP综合评分参数 · 仅语音预览");
             }else{
                 Toast.makeText(this,"保存失败：参数未生效",Toast.LENGTH_LONG).show();
             }

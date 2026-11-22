@@ -23,13 +23,13 @@ public final class VoiceDiagnostics {
     private float dbfs=-90f;
     private boolean activity;
     private long frames,dropped,kwsAt,vadAt,verdictAt;
-    private String engine="未启动", keyword="未捕获关键词",vad="尚无完整语音片段",
+    private String engine="未启动", keyword="160ms滚动PCM缓存未启动",vad="尚无完整语音片段",
         personal="未评估（需先得到VAD片段）",verdict="尚无最终裁决",
         cause="先启动监听，再说一条完整固定口令",timing="暂无耗时数据";
 
     public synchronized void reset(){
         frames=0;dropped=0;kwsAt=0;vadAt=0;verdictAt=0;dbfs=-90f;activity=false;
-        keyword="未捕获关键词";vad="尚无完整语音片段";
+        keyword="160ms滚动PCM缓存未启动";vad="尚无完整语音片段";
         personal="未评估（需先得到VAD片段）";verdict="尚无最终裁决";
         cause="记录已清空；请说一条固定口令";timing="暂无耗时数据";
     }
@@ -42,6 +42,12 @@ public final class VoiceDiagnostics {
         activity=activityNow;frames++;
     }
     public synchronized void onDroppedAudio(){dropped++;cause="解码线程跟不上：过期录音已被丢弃";}
+    /** PCM hop notification only; not a KWS hit and not neural inference. */
+    public synchronized void onStreamHop(long hops,int bufferedSamples,long whenMs){
+        kwsAt=whenMs;
+        keyword="160ms PCM步进 "+hops+" 次 · 滚动缓存 "+
+            String.format(java.util.Locale.ROOT,"%.2f",bufferedSamples/16000f)+" 秒";
+    }
     public synchronized void onKeyword(String text,boolean conflict,long elapsedMs){
         if(text==null||text.isEmpty())return;
         kwsAt=elapsedMs;
@@ -56,12 +62,9 @@ public final class VoiceDiagnostics {
             sampleCount/16000f, accepted?" · 有效":" · 长度不合格");
         if(!accepted){cause="VAD 有片段，但长度未通过录音时长检查";return;}
         if(keywordInSegment==null||keywordInSegment.trim().isEmpty()){
-            keyword="该段无KWS命中";
-            kwsAt=0; // Avoid attributing an older utterance's hit to this clip.
-            cause="VAD 已分段，但 KWS 未检测到白名单关键词";
+            cause="VAD已产生有效片段，已交给独立TFLite神经线程";
         }else{
-            keyword="该段关键词："+keywordInSegment;
-            cause="KWS 与 VAD 均有事件，进入命令裁决";
+            cause="VAD片段包含旧版KWS证据（兼容测试）";
         }
     }
     public synchronized void onPersonal(String result){personal=result==null?"未评估":result;}
@@ -70,7 +73,7 @@ public final class VoiceDiagnostics {
         cause=why==null?"无进一步说明":why;
         String a=(kwsAt>0&&kwsAt<=nowMs)?(nowMs-kwsAt)+"ms":"无KWS时间";
         String b=(vadAt>0&&vadAt<=nowMs)?(nowMs-vadAt)+"ms":"无VAD时间";
-        timing="KWS→裁决 "+a+" / VAD→裁决 "+b+
+        timing="缓存步进→裁决 "+a+" / VAD→裁决 "+b+
             " / 本段策略处理 "+Math.max(0,processingMs)+"ms";
     }
     public synchronized void onError(String stage,String reason){

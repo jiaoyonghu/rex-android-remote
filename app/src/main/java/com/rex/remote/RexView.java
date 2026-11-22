@@ -38,7 +38,7 @@ public final class RexView extends View {
         void onFinishCommandTraining();
         void onResetDiagnostics();
         void onCopyDiagnostics(String report);
-        default boolean onSaveFusionSettings(CommandFusion.Config settings){return false;}
+        default boolean onSaveFusionSettings(NeuralFusion.Config settings){return false;}
     }
     private static final int W=360,H=780;
     private final Actions actions;
@@ -86,7 +86,7 @@ public final class RexView extends View {
     private int diagnosticTaps;
     private int tuningTaps,tuningDrag=-1;
     private long lastTuningTapMs;
-    private CommandFusion.Config tuningDraft;
+    private NeuralFusion.Config tuningDraft;
     private long lastDiagnosticTapMs;
     private String diagEngine="未启动",diagKws="未捕获关键词",diagVad="尚无完整语音片段",
         diagPersonal="未评估",diagVerdict="尚无最终裁决",
@@ -166,7 +166,7 @@ public final class RexView extends View {
         add(143,520,217,578,"转个圈","随机",RexCommand.TURN_AROUND);
         add(20,585,172,639,"激活","ACTIVE",RexCommand.ACTIVE);
         add(188,585,340,639,"失能 · 高风险","二次确认",RexCommand.DISABLE);
-        tuningDraft=CommandFusion.load(context);
+        tuningDraft=NeuralFusion.load(context);
         setLayerType(View.LAYER_TYPE_HARDWARE,null);
     }
     private static void initScatter(Random random,float[] xs,float[] ys){
@@ -195,60 +195,62 @@ public final class RexView extends View {
     }
     private void openTuning(){
         // Reload only the SAVED values. Unsaved edits never reach VoiceService.
-        tuningDraft=CommandFusion.load(getContext());
+        tuningDraft=NeuralFusion.load(getContext());
         changePage(PAGE_TUNE);
     }
     private void discardTuning(){
-        tuningDraft=CommandFusion.load(getContext());tuningDrag=-1;
+        tuningDraft=NeuralFusion.load(getContext());tuningDrag=-1;
         changePage(PAGE_VOICE);
     }
     private void updateTuning(float x,int control){
-        if(tuningDraft==null)tuningDraft=CommandFusion.defaults();
+        if(tuningDraft==null)tuningDraft=NeuralFusion.defaults();
         float t=Math.max(0f,Math.min(1f,(x-36f)/288f));
         t=Math.round(t*100f)/100f;
-        float k=tuningDraft.kwsWeight,n=tuningDraft.neuralWeight;
-        float ng=tuningDraft.neuralThreshold,total=tuningDraft.totalThreshold;
-        if(control==0){k=t;n=1f-t;}
-        if(control==1){n=t;k=1f-t;}
-        if(control==2)ng=.5f+.5f*t;
-        if(control==3)total=t;
-        tuningDraft=new CommandFusion.Config(k,n,ng,total,tuningDraft.neuralMode);
+        float tw=tuningDraft.templateWeight,hw=tuningDraft.headWeight;
+        float tg=tuningDraft.templateThreshold,hg=tuningDraft.headThreshold;
+        float total=tuningDraft.totalThreshold;
+        if(control==0){tw=t;hw=1f-t;}
+        if(control==1){hw=t;tw=1f-t;}
+        if(control==2)tg=.5f+.5f*t;
+        if(control==3)hg=.5f+.5f*t;
+        if(control==4)total=t;
+        tuningDraft=new NeuralFusion.Config(tw,hw,tg,hg,total,tuningDraft.mode);
         invalidate();
     }
     private void drawSettingSlider(Canvas c,int top,String name,float value,float min,float max,
                                    String note){
-        box(c,20,top,340,top+80,0xB02D1B2E,11);
-        text(c,name,30,top+22,12,0xFFFFCBDB,true);
-        text(c,String.format(java.util.Locale.ROOT,"%.2f",value),285,top+22,14,0xFFFFA2C2,true);
-        line(c,36,top+54,324,top+54,0x795C3B52,5);
+        box(c,20,top,340,top+66,0xB02D1B2E,11);
+        text(c,name,30,top+18,12,0xFFFFCBDB,true);
+        text(c,String.format(java.util.Locale.ROOT,"%.2f",value),285,top+18,14,0xFFFFA2C2,true);
+        line(c,36,top+40,324,top+40,0x795C3B52,5);
         float pos=Math.max(0f,Math.min(1f,(value-min)/(max-min)));
-        line(c,36,top+54,36+288*pos,top+54,0xFFFF83B2,5);
-        solid(0xFFFFD5E3);c.drawCircle(36+288*pos,top+54,8,paint);
-        text(c,note,32,top+74,8,0xFFC6A5B4,false);
+        line(c,36,top+40,36+288*pos,top+40,0xFFFF83B2,5);
+        solid(0xFFFFD5E3);c.drawCircle(36+288*pos,top+40,8,paint);
+        text(c,note,32,top+59,8,0xFFC6A5B4,false);
     }
     private void drawFusionTuning(Canvas c){
-        if(tuningDraft==null)tuningDraft=CommandFusion.defaults();
-        center(c,"口令加权识别 / WEIGHTED FUSION",180,176,13,0xFFFFD1E1,true);
-        center(c,"右上角三击返回不保存 · 拖动调整百分比",180,199,9,0xFFBDA0B1,false);
-        drawSettingSlider(c,208,"Zipformer 命中权重",tuningDraft.kwsWeight,0f,1f,
-            "KWS 仅命中=1 / 未命中=0，不是声学概率");
-        drawSettingSlider(c,295,"openWakeWord 权重",tuningDraft.neuralWeight,0f,1f,
-            "双权重合计100%，调整一项自动调整另一项");
-        drawSettingSlider(c,382,"神经相似度门槛",tuningDraft.neuralThreshold,.5f,1f,
-            tuningDraft.neuralMode==CommandFusion.Config.MODE_CONTINUOUS?
-                "连续模式保留原得分；此门槛只用于模式2":
-                "模式2低于门槛记0；默认 0.92（未经校准）");
-        drawSettingSlider(c,469,"最终综合得分门槛",tuningDraft.totalThreshold,0f,1f,
-            "得分高于门槛才确认；VAD 必须先通过");
-        box(c,20,560,340,639,0xAA261C2D,11);
-        text(c,"个人神经门槛处理模式（点击切换）",30,575,10,0xFFECC3D2,true);
-        boolean continuous=tuningDraft.neuralMode==CommandFusion.Config.MODE_CONTINUOUS;
-        box(c,30,582,175,615,continuous?0xC5743857:0x85502B41,8);
-        center(c,"模式1：连续加权",102,602,11,continuous?0xFFFFFFFF:0xFFE6C0D0,true);
-        box(c,185,582,330,615,!continuous?0xC5743857:0x85502B41,8);
-        center(c,"模式2：低于归零",257,602,11,!continuous?0xFFFFFFFF:0xFFE6C0D0,true);
-        text(c,continuous?"仍需个人模型有效、无冲突；CAM++ 不参与评分":
-            "低于门槛记0；冲突拒绝；不自动发射红外",30,632,9,0xFFC9A7B8,false);
+        if(tuningDraft==null)tuningDraft=NeuralFusion.defaults();
+        center(c,"神经匹配 + 监督MLP / 权重设置",180,176,13,0xFFFFD1E1,true);
+        center(c,"右上角三击取消 · 参数只在保存后生效",180,195,9,0xFFBDA0B1,false);
+        drawSettingSlider(c,201,"神经模板权重",tuningDraft.templateWeight,0f,1f,
+            "两项权重之和100% · Zipformer KWS 已关闭");
+        drawSettingSlider(c,270,"已训练 MLP 权重",tuningDraft.headWeight,0f,1f,
+            "命中模板时仅算对应MLP，否则扫描全部分类头");
+        drawSettingSlider(c,339,"模板相似度门槛",tuningDraft.templateThreshold,.5f,1f,
+            "仅外部门槛；内部动态质量及歧义检查仍生效");
+        drawSettingSlider(c,408,"MLP 输出门槛",tuningDraft.headThreshold,.5f,1f,
+            "内部最低 0.64 的模型有效性门槛仍保留");
+        drawSettingSlider(c,477,"融合总分门槛",tuningDraft.totalThreshold,0f,1f,
+            "VAD 完整分段后才确认 · 不会自动发送红外");
+        box(c,20,549,340,637,0xAA261C2D,11);
+        text(c,"神经模型低分处理（点击选择）",30,566,10,0xFFECC3D2,true);
+        boolean continuous=tuningDraft.mode==NeuralFusion.Config.MODE_CONTINUOUS;
+        box(c,30,580,175,613,continuous?0xC5743857:0x85502B41,8);
+        center(c,"模式1：连续加权",102,601,11,continuous?0xFFFFFFFF:0xFFE6C0D0,true);
+        box(c,185,580,330,613,!continuous?0xC5743857:0x85502B41,8);
+        center(c,"模式2：低于归零",257,601,11,!continuous?0xFFFFFFFF:0xFFE6C0D0,true);
+        text(c,continuous?"有效结果不因外部门槛归零；仍检查内部有效性":
+            "低于对应门槛记0；MLP和模板均可独立补救",30,631,9,0xFFC9A7B8,false);
         box(c,20,650,170,697,0xAF3B2539,11);
         center(c,"取消修改",95,678,13,0xFFE4B5C9,true);
         box(c,190,650,340,697,0xC35F2B48,11);
@@ -578,11 +580,11 @@ public final class RexView extends View {
         text(c,shortText(meta,48),30,top+61,8,0xFFC4A0B0,false);
     }
     private String diagnosticReport(){
-        return "REx v1.3 语音链路诊断\n"+
+        return "REx v1.5 语音链路诊断\n"+
             "引擎: "+diagEngine+"\n"+
             String.format(java.util.Locale.ROOT,"PCM: %.1f dBFS, 活动提示=%s, 帧=%d, 丢弃=%d\n",
                 diagDbfs,diagActivity,diagFrames,diagDrops)+
-            "KWS: "+diagKws+" ("+ageFor(diagKwsAt)+")\n"+
+            "160ms缓存: "+diagKws+" ("+ageFor(diagKwsAt)+")\n"+
             "VAD: "+diagVad+" ("+ageFor(diagVadAt)+")\n"+
             "个人模型: "+diagPersonal+"\n"+
             "最终裁决: "+diagVerdict+" ("+ageFor(diagVerdictAt)+")\n"+
@@ -593,10 +595,10 @@ public final class RexView extends View {
     private String diagnosticHint(){
         long now=SystemClock.elapsedRealtime();
         if(diagDrops>0)return "存在过期录音丢弃：请检查模型计算负载";
-        if(diagKwsAt>diagVadAt && diagKwsAt>0 && now-diagKwsAt>3000)
-            return "KWS已命中但VAD未出段：请检查语音分段";
-        if(diagVadAt>0 && diagKwsAt==0 && diagVerdictAt>=diagVadAt)
-            return "VAD已收到语音，但KWS未命中：检查发音或阈值";
+        if(diagVadAt>0 && diagVerdictAt<diagVadAt)
+            return "VAD已经分段，神经线程正在推理或等待处理";
+        if(diagVadAt==0 && diagFrames>0)
+            return "已录到声音但尚无VAD语音段，请检查VAD门槛和停顿";
         return diagCause;
     }
     private void drawDiagnostics(Canvas c){
@@ -606,18 +608,18 @@ public final class RexView extends View {
             String.format(java.util.Locale.ROOT,"音量 %.1f dBFS · %s",diagDbfs,
                 diagActivity?"声音活动提示":"未触发活动提示"),
             "已读 "+diagFrames+" 帧 · 丢弃队列 "+diagDrops+" 次 · "+shortText(diagEngine,19));
-        diagRow(c,286,"02","Zipformer KWS（实时）",diagKws,
-            "最近 KWS 事件 "+ageFor(diagKwsAt)+" · 只检测预设关键词");
+        diagRow(c,286,"02","160ms 音频滚动缓存",diagKws,
+            "最近增量PCM缓存更新 "+ageFor(diagKwsAt)+" · 非增量TFLite特征");
         diagRow(c,363,"03","Silero VAD（语音分段）",diagVad,
             "最近 VAD 片段 "+ageFor(diagVadAt)+" · 与音量活动提示独立");
-        diagRow(c,440,"04","个人神经模板（按需）",diagPersonal,
-            "TFLite 特征 · 未训练时不会执行个人匹配");
+        diagRow(c,440,"04","神经模板 + 监督MLP",diagPersonal,
+            "TFLite 在独立线程运行 · 保留旧训练数据");
         diagRow(c,517,"05","最终裁决",diagVerdict,
             "最近裁决 "+ageFor(diagVerdictAt)+" · 不连接红外动作");
         box(c,20,594,340,647,0xBA402339,10);
         text(c,shortText(diagnosticHint(),35),29,611,10,0xFFFFC6D8,true);
         text(c,shortText(diagTiming,57),29,627,8,0xFFE2B3C9,false);
-        text(c,"没有VAD片段时无法确认原因；请结合KWS和音量观察",29,641,8,0xFFB78A9F,false);
+        text(c,"无VAD段时不能识别；KWS关闭，留意模型分数与排队",29,641,8,0xFFB78A9F,false);
         box(c,20,656,120,699,0xAD502842,10);
         center(c,voiceStarted?"监听运行中":"启动监听",70,673,10,0xFFFFD4E1,true);
         center(c,"长按关闭",70,690,8,0xFFCAA1B4,false);
@@ -724,8 +726,8 @@ public final class RexView extends View {
             downMs=SystemClock.elapsedRealtime();
             tuningDrag=-1;
             if(page==PAGE_TUNE && x>=20 && x<=340){
-                int[] tops={208,295,382,469};
-                for(int i=0;i<4;i++)if(y>=tops[i]+35 && y<=tops[i]+76){
+                int[] tops={201,270,339,408,477};
+                for(int i=0;i<5;i++)if(y>=tops[i]+25 && y<=tops[i]+66){
                     tuningDrag=i;updateTuning(x,i);break;
                 }
             }
@@ -751,18 +753,18 @@ public final class RexView extends View {
             }
             if(page==PAGE_TUNE){
                 if(tuningDrag>=0){updateTuning(x,tuningDrag);tuningDrag=-1;return true;}
-                if(y>=582 && y<=615 && x>=30 && x<=330){
-                    CommandFusion.Config d=tuningDraft;
-                    int mode=x<180?CommandFusion.Config.MODE_CONTINUOUS:
-                        CommandFusion.Config.MODE_ZERO_BELOW;
-                    tuningDraft=new CommandFusion.Config(d.kwsWeight,d.neuralWeight,
-                        d.neuralThreshold,d.totalThreshold,mode);
+                if(y>=580 && y<=613 && x>=30 && x<=330){
+                    NeuralFusion.Config d=tuningDraft;
+                    int mode=x<180?NeuralFusion.Config.MODE_CONTINUOUS:
+                        NeuralFusion.Config.MODE_ZERO_BELOW;
+                    tuningDraft=new NeuralFusion.Config(d.templateWeight,d.headWeight,
+                        d.templateThreshold,d.headThreshold,d.totalThreshold,mode);
                     invalidate();return true;
                 }
                 if(y>=650 && y<=699){
                     if(x<180)discardTuning();
                     else if(actions.onSaveFusionSettings(tuningDraft)){
-                        tuningDraft=CommandFusion.load(getContext());
+                        tuningDraft=NeuralFusion.load(getContext());
                         changePage(PAGE_VOICE);
                     }
                 }
