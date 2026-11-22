@@ -126,6 +126,30 @@ public final class PersonalNeuralStore {
         float offset=takes.size()>=RECOMMENDED_TAKES?.065f:.045f;
         return Math.max(.72f,Math.min(.90f,lowest-offset));
     }
+    /** The trained head may select a phrase different from the top template.
+     * Compute the RAW cosine evidence for that SAME phrase; an intrinsic
+     * dynamic gate or competing-phrase margin must not erase the score.
+     * Returns null when that phrase has too few enrolled samples.
+     */
+    public synchronized Result evaluatePhrase(float[] input,int phrase){
+        float[] sample=unit(input);
+        if(sample==null||phrase<0||phrase>=CommandPhrases.count())return null;
+        List<float[]> takes=load(phrase);
+        if(takes.size()<MIN_TAKES)return null;
+        float score=bestThreeScore(takes,sample);
+        float gate=personalGate(takes);
+        return new Result(phrase,-1,score,0f,gate,takes.size(),score>=gate,
+            score>=gate?"单条口令原始模板分数":"单条口令原始分数低于旧动态线（仍可加权）");
+    }
+    private static float bestThreeScore(List<float[]> takes,float[] sample){
+        float a=-2,b=-2,c=-2;
+        for(float[] v:takes){float s=cosine(v,sample);
+            if(s>a){c=b;b=a;a=s;}
+            else if(s>b){c=b;b=s;}
+            else if(s>c)c=s;
+        }
+        return (a+b+c)/3f;
+    }
     public synchronized Result evaluate(float[] input){
         float[] sample=unit(input);
         if(sample==null)return new Result(-1,-1,0,0,1,0,false,"神经特征无效");
@@ -134,11 +158,8 @@ public final class PersonalNeuralStore {
         for(int p=0;p<CommandPhrases.count();p++){
             List<float[]> take=load(p);
             if(take.size()<MIN_TAKES)continue;
-            // Mean of 3 best takes instead of a one-shot nearest neighbour.
-            float a=-2,b=-2,c=-2;
-            for(float[] v:take){float s=cosine(v,sample);
-                if(s>a){c=b;b=a;a=s;}else if(s>b){c=b;b=s;}else if(s>c)c=s;}
-            float score=(a+b+c)/3f;
+            // The same top-three rule is used for global and per-phrase scores.
+            float score=bestThreeScore(take,sample);
             if(score>high){second=high;runner=best;high=score;best=p;}
             else if(score>second){second=score;runner=p;}
         }

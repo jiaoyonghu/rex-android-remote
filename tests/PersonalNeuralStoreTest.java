@@ -26,6 +26,19 @@ public final class PersonalNeuralStoreTest {
         check(result.accepted && result.phrase==1,"trained wake recognised");
         var wrong=store.evaluate(addNoise(forward,190,.018f));
         check(wrong.accepted && wrong.phrase==6,"trained action recognised");
+        var same=store.evaluatePhrase(addNoise(wake,90,.018f),1);
+        check(same!=null && same.phrase==1 && Math.abs(same.score-result.score)<.00001f,
+            "per-phrase score must equal the top-three score of the global winner");
+        var other=store.evaluatePhrase(addNoise(wake,90,.018f),6);
+        check(other!=null && other.phrase==6 && other.score<same.score,
+            "when MLP selects another phrase, template score must belong to that phrase");
+        var wrongWinner=new PersonalWakeHead.Result(6,-1,10,.789f,0f,true,"synthetic");
+        var aligned=NeuralFusion.templateForHead(store,addNoise(wake,90,.018f),
+            result,wrongWinner,false);
+        check(aligned!=null && aligned.phrase==6 && Math.abs(aligned.score-other.score)<.00001f,
+            "global MLP winner must receive ITS OWN template score, not template winner's score");
+        check(store.evaluatePhrase(addNoise(wake,90,.018f),2)==null,
+            "untrained command must not have an invented matching score");
         check(!store.evaluate(vector(999)).accepted,"unseen noise must not match");
         for(int i=12;i<33;i++)check(store.add(1,addNoise(wake,i,.015f))==null,"more training");
         check(store.count(1)==30,"rolling cap at 30 samples");

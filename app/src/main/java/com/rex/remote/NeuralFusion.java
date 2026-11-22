@@ -61,28 +61,59 @@ public final class NeuralFusion {
     private static Decision reject(String why,float t,float h,float total){
         return new Decision(null,false,false,t,h,total,why);
     }
-    /** Caller evaluates one corresponding head if a valid template is found;
-     * otherwise it evaluates all trained heads. Neither path needs KWS.
-     * A returned head must pass its intrinsic one-vs-rest gate (>=0.64 and,
-     * for global search, runner-up margin), even in continuous mode.
+    /** Routing uses the USER's saved template threshold, never the old
+     * template's hidden dynamic threshold or runner-up margin.
+     * This selects a cheap one-head fast path; it is NOT a final pass verdict.
+     */
+    public static boolean useTemplateFastPath(PersonalNeuralStore.Result template,Config cfg){
+        if(cfg==null)cfg=defaults();
+        return validTemplate(template)&&template.score>=cfg.templateThreshold;
+    }
+    /** Align evidence to the final trained-head phrase. A different best
+     * template must NEVER be blended with the head's score. In the absence
+     * of any head, keep the old template-only fallback only on a user-gate hit.
+     */
+    public static PersonalNeuralStore.Result templateForHead(
+            PersonalNeuralStore store,float[] embedding,PersonalNeuralStore.Result top,
+            PersonalWakeHead.Result head,boolean fastPath){
+        if(validHead(head)){
+            if(validTemplate(top)&&top.phrase==head.phrase)return top;
+            return store==null?null:store.evaluatePhrase(embedding,head.phrase);
+        }
+        return fastPath&&validTemplate(top)?top:null;
+    }
+    private static boolean validTemplate(PersonalNeuralStore.Result t){
+        return t!=null&&t.phrase>=0&&t.phrase<CommandPhrases.count()&&
+            Float.isFinite(t.score)&&t.score>=0f&&t.score<=1f;
+    }
+    private static boolean validHead(PersonalWakeHead.Result h){
+        return h!=null&&h.phrase>=0&&h.phrase<CommandPhrases.count()&&
+            Float.isFinite(h.score)&&h.score>=0f&&h.score<=1f;
+    }
+    /** Both scores must describe the SAME candidate phrase. VoiceService
+     * routes one head on a template hit; otherwise searches all trained heads
+     * and recomputes the raw template score for the winning head's phrase.
+     * Old hidden 'accepted' gates are diagnostic only. Mode 1 weights raw
+     * evidence, mode 2 zeros evidence below the USER's corresponding gate.
+     * Final acceptance is determined by the composite total threshold and
+     * existing whitelist / awake / manual-only safety restrictions.
      */
     public static Decision evaluate(boolean awake,PersonalNeuralStore.Result template,
                                     PersonalWakeHead.Result head,Config cfg){
         if(cfg==null)cfg=defaults();
-        boolean templateValid=template!=null&&template.accepted&&template.phrase>=0&&
-            template.phrase<CommandPhrases.count()&&Float.isFinite(template.score)&&
-            template.score>=0&&template.score<=1;
-        boolean headValid=head!=null&&head.accepted&&head.phrase>=0&&
-            head.phrase<CommandPhrases.count()&&Float.isFinite(head.score)&&
-            head.score>=0&&head.score<=1;
-        if(templateValid&&headValid&&template.phrase!=head.phrase)
-            return reject("模板与MLP口令不一致，拒绝融合",0,0,0);
-        float t=templateValid&&(cfg.mode==Config.MODE_CONTINUOUS||
+        boolean templatePresent=validTemplate(template);
+        boolean headPresent=validHead(head);
+        if(templatePresent&&headPresent&&template.phrase!=head.phrase)
+            return reject("模板与MLP不是同一指令，拒绝交叉加权",0f,0f,0f);
+        if(!templatePresent&&!headPresent)
+            return reject("未找到有分数的模板或已训练分类头",0f,0f,0f);
+        float t=templatePresent&&(cfg.mode==Config.MODE_CONTINUOUS||
             template.score>=cfg.templateThreshold)?template.score:0f;
-        float h=headValid&&(cfg.mode==Config.MODE_CONTINUOUS||
+        float h=headPresent&&(cfg.mode==Config.MODE_CONTINUOUS||
             head.score>=cfg.headThreshold)?head.score:0f;
-        if(t==0f&&h==0f)return reject("模板与分类头均未通过有效性/门槛检查",0,0,0);
-        int phrase=t>0?template.phrase:head.phrase;
+        if(t==0f&&h==0f)
+            return reject("两路分数经用户门槛处理后均为零",0f,0f,0f);
+        int phrase=headPresent?head.phrase:template.phrase;
         RexCommand cmd=CommandPhrases.command(phrase);
         float total=cfg.templateWeight*t+cfg.headWeight*h;
         if(cmd==null)return reject("口令不在固定指令白名单",t,h,total);
@@ -95,7 +126,8 @@ public final class NeuralFusion {
         if(total+1e-6f<cfg.totalThreshold)
             return reject("综合评分未达到门槛",t,h,total);
         return new Decision(cmd==RexCommand.WAKE?null:cmd,cmd==RexCommand.WAKE,true,t,h,
-            total,t>0&&h>0?"模板和MLP对同一口令一致":t>0?
-            "仅模板有效，允许兜底":"仅已训练MLP有效，允许兜底");
+            total,t>0&&h>0?"同口令模板+MLP加权通过":t>0?
+            "模板兜底通过（该口令暂无分类头或分类头权重为零）":
+            "MLP搜索/候选评分通过");
     }
 }

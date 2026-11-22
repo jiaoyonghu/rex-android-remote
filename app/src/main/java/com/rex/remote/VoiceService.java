@@ -422,21 +422,39 @@ public final class VoiceService extends Service {
         long templateStart=SystemClock.elapsedRealtime();
         PersonalNeuralStore.Result template=utteranceFeature==null?null:neural.evaluate(utteranceFeature);
         long templateMs=SystemClock.elapsedRealtime()-templateStart;
-        long headStart=SystemClock.elapsedRealtime();
-        // Template accepted -> evaluate only corresponding MLP. Otherwise scan
-        // all trained heads, so a missed template cannot block a valid phrase.
-        PersonalWakeHead.Result head=utteranceFeature==null?null:
-            (template!=null&&template.accepted?
-                trainedHead.evaluatePhrase(utteranceFeature,template.phrase):
-                trainedHead.evaluate(utteranceFeature));
-        long headMs=SystemClock.elapsedRealtime()-headStart;
         NeuralFusion.Config cfg=NeuralFusion.load(this);
-        NeuralFusion.Decision decision=NeuralFusion.evaluate(awake,template,head,cfg);
+        // Candidate routing depends ONLY on the saved user template threshold.
+        // Old template.accepted (dynamic gate / .07 runner-up margin) no longer
+        // blocks a high-scoring phrase from reaching its trained MLP.
+        boolean fastPath=NeuralFusion.useTemplateFastPath(template,cfg);
+        long headStart=SystemClock.elapsedRealtime();
+        PersonalWakeHead.Result head=utteranceFeature==null?null:
+            fastPath?trainedHead.evaluatePhrase(utteranceFeature,template.phrase):
+                     trainedHead.evaluate(utteranceFeature);
+        long headMs=SystemClock.elapsedRealtime()-headStart;
+        // On all-head search, score the MLP winner against its OWN templates.
+        // Never add a different phrase's best template score to this head.
+        PersonalNeuralStore.Result selectedTemplate=NeuralFusion.templateForHead(
+            neural,utteranceFeature,template,head,fastPath);
+        NeuralFusion.Decision decision=NeuralFusion.evaluate(awake,selectedTemplate,head,cfg);
         long queueMs=SystemClock.elapsedRealtime()-queuedAt;
         diagnostics.onPersonal(String.format(java.util.Locale.ROOT,
-            "v1.5 模板 %s / MLP %s · 特征 %dms 模板 %dms MLP %dms · 排队及处理 %dms · %s",
-            template==null?"无":String.format(java.util.Locale.ROOT,"%.3f(%s)",template.score,template.accepted?"有效":"未通过"),
-            head==null?"未训练":String.format(java.util.Locale.ROOT,"%.3f(%s)",head.score,head.accepted?"有效":"未通过"),
+            "v1.5 模板第一名 %s / 路由 %s / 同词模板 %s / MLP %s · 特征 %dms 模板 %dms MLP %dms · 排队及处理 %dms · %s",
+            template==null?"无":String.format(java.util.Locale.ROOT,
+                "%s %.3f(%s;次高%s %.3f;差距%.3f;动态线%.3f;原因%s)",
+                template.phrase>=0&&template.phrase<CommandPhrases.count()?CommandPhrases.at(template.phrase):"无候选",
+                template.score,template.accepted?"旧检查通过":"旧检查未过但不拦截",
+                template.runnerUp>=0&&template.runnerUp<CommandPhrases.count()?CommandPhrases.at(template.runnerUp):"无",
+                template.runnerUp>=0?template.second:0f,
+                template.runnerUp>=0?template.score-template.second:1f,
+                template.threshold,template.reason),
+            fastPath?"达用户门槛→单个分类头":"低于用户门槛→全分类头搜索",
+            selectedTemplate==null?"无该口令模板":String.format(java.util.Locale.ROOT,
+                "%s %.3f(原始值;参与加权 %.3f)",
+                CommandPhrases.at(selectedTemplate.phrase),selectedTemplate.score,decision.templateScore),
+            head==null?"未训练":String.format(java.util.Locale.ROOT,"%s %.3f(%s)",
+                head.phrase>=0&&head.phrase<CommandPhrases.count()?CommandPhrases.at(head.phrase):"无候选",
+                head.score,head.accepted?"旧检查通过":"旧检查未过但按用户模式加权"),
             embedMs,templateMs,headMs,queueMs,decision.report(cfg)));
         // No KWS evidence exists in v1.5; VAD+personal networks only.
         if(!decision.pass){
