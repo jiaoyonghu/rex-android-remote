@@ -14,11 +14,57 @@ import android.os.Build;
 import android.os.Bundle;
 import android.view.WindowManager;
 import android.widget.Toast;
+import android.widget.EditText;
+import android.os.SystemClock;
 
-/** Voice preview, local speaker enrollment, and separate manual IR controls. */
+/** Local speech recognition and foreground WiFi command transport. */
 public final class MainActivity extends Activity implements RexView.Actions {
     private static final int MIC_REQUEST=21;
-    private NecIr ir;
+    private WifiLink wifi;
+    private boolean foreground, wifiConnected, voiceAllowed;
+    private long voiceAllowedAt;
+    private int linkGeneration;
+    private String linkState="未连接";
+    private AlertDialog voiceConfirm;
+    private String wifiKey(){return getSharedPreferences("rex_wifi",MODE_PRIVATE).getString("key","");}
+    private void refreshWifi(){if(view!=null)view.setIrStatus("WiFi "+linkState+" · 语音"+(voiceAllowed?"ON":"OFF")+" · 点击设置");}
+    private void disarmVoice(){voiceAllowed=false; if(voiceConfirm!=null){voiceConfirm.dismiss();voiceConfirm=null;} refreshWifi();}
+    private void disconnectWifi(){++linkGeneration;wifiConnected=false;disarmVoice();if(wifi!=null){wifi.close();wifi=null;}linkState="未连接";refreshWifi();}
+    private void connectWifi(){
+        disconnectWifi();String key=wifiKey();
+        if(!foreground||key.isEmpty()){linkState="点击配对";refreshWifi();return;}
+        final int gen=linkGeneration;linkState="连接中";refreshWifi();
+        wifi=new WifiLink(this,key,new WifiLink.Listener(){
+            public void status(boolean connected,String state){runOnUiThread(()->{
+                if(gen!=linkGeneration||!foreground)return;
+                wifiConnected=connected;linkState=state.equals("READY")?"PPO就绪":state.equals("CONNECTED")?"已连接":state.equals("FAULT")?"故障锁存":state.equals("WAIT_GRAPH")?"等待控制器":state;
+                if(!connected||state.equals("FAULT"))disarmVoice();refreshWifi();
+            });}
+            public void reply(RexCommand cmd,String state){runOnUiThread(()->{
+                if(gen!=linkGeneration||!foreground)return;
+                view.setMessage(cmd.label+" · "+state+"（请求回执）");
+            });}
+        });
+    }
+    @Override public void onWifiSettings(){
+        String[] items={"输入 / 更新配对密钥","开启本次语音控制","关闭语音控制并停止","重新连接"};
+        new AlertDialog.Builder(this).setTitle("REx WiFi · 10.42.0.1").setItems(items,(d,i)->{
+            if(i==0){
+                EditText e=new EditText(this);e.setSingleLine(true);e.setHint("64位配对密钥");
+                new AlertDialog.Builder(this).setTitle("机器人配对密钥").setView(e).setNegativeButton("取消",null).setPositiveButton("保存",(a,b)->{
+                    String k=e.getText().toString().trim();try{WifiLink.decode(k);getSharedPreferences("rex_wifi",MODE_PRIVATE).edit().putString("key",k).apply();connectWifi();}
+                    catch(IllegalArgumentException ex){view.setMessage("配对密钥格式错误");}
+                }).show();
+            }else if(i==1){
+                if(!wifiConnected){view.setMessage("先连接机器人");return;}
+                new AlertDialog.Builder(this).setTitle("开启本次语音控制？").setMessage("个人口令模型不是身份认证，可能误识别。仅在现场试验条件满足、App前台时允许方向及动作口令。激活、站立、失能仍需确认。物理急停必须可用。")
+                .setNegativeButton("取消",null).setPositiveButton("开启",(a,b)->{if(foreground&&wifiConnected){voiceAllowed=true;voiceAllowedAt=SystemClock.elapsedRealtime();refreshWifi();}}).show();
+            }else if(i==2){disarmVoice();sendWifi(RexCommand.STOP);}else connectWifi();
+        }).show();
+    }
+    @Override protected void onResume(){super.onResume();foreground=true;connectWifi();}
+    @Override protected void onPause(){foreground=false;disconnectWifi();super.onPause();}
+
     private RexView view;
     private boolean registered;
     private boolean enrollmentAfterPermission;
@@ -54,6 +100,16 @@ public final class MainActivity extends Activity implements RexView.Actions {
                 i.getLongExtra(VoiceService.EXTRA_DIAG_KWS_AT,0),
                 i.getLongExtra(VoiceService.EXTRA_DIAG_VAD_AT,0),
                 i.getLongExtra(VoiceService.EXTRA_DIAG_VERDICT_AT,0));
+            String finalCommand=i.getStringExtra(VoiceService.EXTRA_COMMAND);
+            long eventAt=i.getLongExtra("wifi_final_elapsed_ms",0);
+            long utteranceAt=i.getLongExtra("wifi_utterance_elapsed_ms",0);
+            if(finalCommand!=null && foreground && wifiConnected && voiceAllowed && utteranceAt>=voiceAllowedAt && eventAt>=utteranceAt && SystemClock.elapsedRealtime()-utteranceAt<=1500 && SystemClock.elapsedRealtime()-eventAt<=500 && SystemClock.elapsedRealtime()>=eventAt){
+                try{
+                    RexCommand c=RexCommand.valueOf(finalCommand);
+                    if(c==RexCommand.SLEEP){disarmVoice();sendWifi(RexCommand.STOP);}
+                    else if(RexCommand.isAction(c))onSend(c);
+                }catch(IllegalArgumentException ignored){}
+            }
             String trainEvent=i.getStringExtra(VoiceService.EXTRA_TRAIN_EVENT);
             view.onTraining(i.getIntExtra(VoiceService.EXTRA_TRAIN_INDEX,0),
                 i.getIntExtra(VoiceService.EXTRA_TRAIN_COUNT,0),
@@ -87,9 +143,8 @@ public final class MainActivity extends Activity implements RexView.Actions {
         getWindow().setStatusBarColor(0xFF08080D);
         getWindow().setNavigationBarColor(0xFF08080D);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        ir=new NecIr(this);
         view=new RexView(this,this);
-        view.setIrStatus(ir.status());
+        refreshWifi();
         setContentView(view);
     }
     @Override protected void onStart() {
@@ -130,6 +185,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
         }
     }
     @Override public void onStopVoice() {
+        if(voiceAllowed){disarmVoice();sendWifi(RexCommand.STOP);}
         stopService(new Intent(this,VoiceService.class));
         view.setVoiceStopped();
     }
@@ -142,6 +198,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
         beginEnrollment();
     }
     private void beginEnrollment(){
+        if(voiceAllowed){disarmVoice();sendWifi(RexCommand.STOP);}
         // Persisted owner data remains intact until ALL prompted phrases pass.
         sendEnrollAction(VoiceService.ACTION_ENROLL_BEGIN,0);
     }
@@ -170,7 +227,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
             requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},MIC_REQUEST);
         }else openTraining();
     }
-    private void openTraining(){sendTrainingAction(VoiceService.ACTION_TRAIN_BEGIN,0,true);}
+    private void openTraining(){if(voiceAllowed){disarmVoice();sendWifi(RexCommand.STOP);}sendTrainingAction(VoiceService.ACTION_TRAIN_BEGIN,0,true);}
     private void sendTrainingAction(String action,int phrase,boolean mayStart){
         try{
             Intent intent=new Intent(this,VoiceService.class).setAction(action);
@@ -222,7 +279,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
             boolean ok=NeuralFusion.save(this,settings);
             if(ok){
                 Toast.makeText(this,"参数已保存；下一段语音开始使用新权重",Toast.LENGTH_SHORT).show();
-                view.setMessage("v1.5 · 已保存模板/MLP综合评分参数 · 仅语音预览");
+                view.setMessage("v1.6 · 已保存模板/MLP综合评分参数");
             }else{
                 Toast.makeText(this,"保存失败：参数未生效",Toast.LENGTH_LONG).show();
             }
@@ -233,23 +290,23 @@ public final class MainActivity extends Activity implements RexView.Actions {
         }
     }
     @Override public void onSend(RexCommand cmd) {
-        if(cmd==RexCommand.SLEEP||cmd==RexCommand.WAKE)return;
+        if(!RexCommand.isAction(cmd))return;
+        if(!foreground||!wifiConnected){view.setMessage("WiFi 未连接 · 指令未发送");return;}
+        if(cmd==RexCommand.STOP){if(voiceConfirm!=null){voiceConfirm.dismiss();voiceConfirm=null;}sendWifi(cmd);return;}
+        if(voiceConfirm!=null)return;
         if(cmd==RexCommand.DISABLE||cmd==RexCommand.ACTIVE||cmd==RexCommand.STAND) {
-            new AlertDialog.Builder(this).setTitle("确认一次红外发射")
-                .setMessage("即将发射「"+cmd.label+"」。红外只能确认手机发射，无法确认机器人收到；失能时机器人可能倒下。")
+            final int gen=linkGeneration;
+            final long confirmAt=SystemClock.elapsedRealtime();
+            voiceConfirm=new AlertDialog.Builder(this).setTitle("确认 WiFi 指令")
+                .setMessage("即将请求「"+cmd.label+"」。确认现场试验条件；失能可能导致倒下。")
                 .setNegativeButton("取消",null)
-                .setPositiveButton("发射",(dialog,which)->sendIr(cmd))
-                .show();
-        } else sendIr(cmd);
+                .setPositiveButton("发送",(dialog,which)->{if(gen==linkGeneration&&foreground&&wifiConnected&&SystemClock.elapsedRealtime()-confirmAt<=10000)sendWifi(cmd);else view.setMessage("确认已过期，请重新发送");})
+                .create();
+            voiceConfirm.setOnDismissListener(d->voiceConfirm=null);voiceConfirm.show();
+        } else sendWifi(cmd);
     }
-    private void sendIr(RexCommand cmd) {
-        try {
-            ir.send(cmd);
-            view.setMessage("手机已发射："+cmd.label+" · 0x"+Integer.toHexString(cmd.code).toUpperCase()
-                +" · 不代表机器人已收到");
-        } catch(Exception ex) {
-            view.setMessage("未发射红外："+ex.getMessage());
-            Toast.makeText(this,"红外不可用，检查 ColorOS 接口",Toast.LENGTH_LONG).show();
-        }
+    private void sendWifi(RexCommand cmd){
+        if(foreground&&wifi!=null&&wifi.submit(cmd))view.setMessage("WiFi 请求："+cmd.label);
+        else view.setMessage("未发送：未连接或正在处理指令");
     }
 }

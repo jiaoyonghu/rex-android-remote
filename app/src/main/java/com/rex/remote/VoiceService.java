@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * REx v1.5: VAD-only sherpa + separate TFLite worker + personal MLP head,
  * no wake timeout and guided phrase-by-phrase speaker enrollment. All spoken robot
- * commands are PREVIEW ONLY: absolutely no voice-to-IR and no robot motors.
+ * Final commands are broadcast to the Activity; only its explicit foreground WiFi authorization can dispatch.
  */
 public final class VoiceService extends Service {
     public static final String ACTION_EVENT="com.rex.remote.VOICE_EVENT";
@@ -117,6 +117,7 @@ public final class VoiceService extends Service {
     private final ArrayBlockingQueue<CommandClip> commandClips=new ArrayBlockingQueue<>(8);
     private volatile long captureGeneration;
     private long lastRealtimeBroadcastMs;
+    private volatile long wifiUtteranceQueuedAt;
     private long lastFinalMs;
     private String lastFinalSignature="";
     private volatile long lastOwnerVerifiedMs;
@@ -482,11 +483,12 @@ public final class VoiceService extends Service {
         else if(command==RexCommand.SLEEP)status="已睡眠";
         else status="识别『"+command.label+"』· 综合得分 "+
             String.format(java.util.Locale.ROOT,"%.3f",decision.total)+
-            " · 仅预览，不发送红外";
+            " · 由前台WiFi授权决定是否发送";
         diagnostics.onVerdict(wake?"唤醒成功":command==RexCommand.SLEEP?
                 "进入待机":"识别成功："+command.label,
             decision.report(cfg),SystemClock.elapsedRealtime(),
             SystemClock.elapsedRealtime()-decisionStarted);
+        wifiUtteranceQueuedAt=queuedAt;
         publish(decision.report(cfg),null,command,wake,0f);
     }
     private static final class NeuralClip {
@@ -717,7 +719,7 @@ public final class VoiceService extends Service {
         Intent i=new Intent(ACTION_EVENT).setPackage(getPackageName());
         if(finalText!=null)i.putExtra(EXTRA_TEXT,finalText);
         if(partial!=null)i.putExtra(EXTRA_PARTIAL,partial);
-        if(command!=null)i.putExtra(EXTRA_COMMAND,command.name());
+        if(command!=null){i.putExtra(EXTRA_COMMAND,command.name());i.putExtra("wifi_final_elapsed_ms",SystemClock.elapsedRealtime());i.putExtra("wifi_utterance_elapsed_ms",wifiUtteranceQueuedAt);}
         if(enrollEvent!=null)i.putExtra(EXTRA_ENROLL_EVENT,enrollEvent);
         if(trainEvent!=null)i.putExtra(EXTRA_TRAIN_EVENT,trainEvent);
         i.putExtra(EXTRA_TRAIN_INDEX,trainingPhrase);

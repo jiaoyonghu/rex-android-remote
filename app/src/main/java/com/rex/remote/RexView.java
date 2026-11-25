@@ -25,6 +25,7 @@ import java.util.Random;
 public final class RexView extends View {
     public interface Actions {
         void onSend(RexCommand command);
+        default void onWifiSettings(){}
         void onStartVoice();
         void onStopVoice();
         void onEnrollVoice();
@@ -68,8 +69,8 @@ public final class RexView extends View {
     private boolean enrollReady;
     private boolean enrollmentDone;
     private boolean enrollmentCapturing;
-    private String message="v1.4 · 个人口令神经训练 · 语音红外未授权";
-    private String irStatus="正在检测 IR";
+    private String message="v1.6 · WiFi 控制 · 点击顶部连接状态";
+    private String irStatus="WiFi 未连接";
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
     private String commandText="";
@@ -241,7 +242,7 @@ public final class RexView extends View {
         drawSettingSlider(c,408,"MLP 输出门槛",tuningDraft.headThreshold,.5f,1f,
             "内部最低 0.64 的模型有效性门槛仍保留");
         drawSettingSlider(c,477,"融合总分门槛",tuningDraft.totalThreshold,0f,1f,
-            "VAD 完整分段后才确认 · 不会自动发送红外");
+            "VAD 完整分段后才确认 · 需前台WiFi授权");
         box(c,20,549,340,637,0xAA261C2D,11);
         text(c,"神经模型低分处理（点击选择）",30,566,10,0xFFECC3D2,true);
         boolean continuous=tuningDraft.mode==NeuralFusion.Config.MODE_CONTINUOUS;
@@ -313,7 +314,7 @@ public final class RexView extends View {
         if(text!=null){
             lastText=text;
             if("SLEEP".equals(command))commandText="已听到『睡觉』 · 回待机";
-            else if(command!=null)commandText="识别 "+command+" · 未授权发射语音红外";
+            else if(command!=null)commandText="识别 "+command+" · 由WiFi授权决定";
             else if(wakeEvent)commandText="REx 已唤醒 · 持续待命";
             else commandText="非白名单指令 · 不执行";
         }else if(partial!=null && !partial.isEmpty()){
@@ -364,7 +365,7 @@ public final class RexView extends View {
         text(c,shortText(irStatus,39),27,137,10,0xFFD3ADB7,false);
         box(c,17,712,343,764,0xBC16151D,12);
         text(c,shortText(message,44),26,734,10,0xFFF0C5CB,false);
-        text(c,"IR 单向传输 · 语音动作未授权 · 状态不代表机器人确认",26,752,8,0xFF9D7581,false);
+        text(c,"WiFi 双向请求回执 · 非电机动作完成确认",26,752,8,0xFF9D7581,false);
     }
     /** Each volume is an irregular particle mesh; no primitive sphere or orbit rings. */
     private void renderVolume(Canvas c,float seconds,boolean inner,float cx,float cy,
@@ -615,7 +616,7 @@ public final class RexView extends View {
         diagRow(c,440,"04","神经模板 + 监督MLP",diagPersonal,
             "TFLite 在独立线程运行 · 保留旧训练数据");
         diagRow(c,517,"05","最终裁决",diagVerdict,
-            "最近裁决 "+ageFor(diagVerdictAt)+" · 不连接红外动作");
+            "最近裁决 "+ageFor(diagVerdictAt)+" · WiFi授权独立");
         box(c,20,594,340,647,0xBA402339,10);
         text(c,shortText(diagnosticHint(),35),29,611,10,0xFFFFC6D8,true);
         text(c,shortText(diagTiming,57),29,627,8,0xFFE2B3C9,false);
@@ -656,7 +657,7 @@ public final class RexView extends View {
         box(c,20,619,340,697,0xA1271B2A,11);
         text(c,shortText(trainInfo,42),28,641,10,0xFFFFCBDA,false);
         text(c,shortText(voiceStatus,42),28,658,9,0xFFC8A5B2,false);
-        text(c,"拒绝相似口令的模糊猜测 · 未授权发射语音红外",28,675,9,0xFFD9AFC1,false);
+        text(c,"拒绝相似口令的模糊猜测 · 由WiFi授权决定",28,675,9,0xFFD9AFC1,false);
         text(c,"末项可录非口令作为负样本；模型在后台训练",28,690,8,0xFFAC8796,false);
     }
     public void openCommandTraining(){
@@ -739,6 +740,7 @@ public final class RexView extends View {
         if(e.getAction()==MotionEvent.ACTION_CANCEL){tuningDrag=-1;return true;}
         if(e.getAction()==MotionEvent.ACTION_UP){
             long now=SystemClock.elapsedRealtime();
+            if((page==PAGE_VOICE||page==PAGE_MANUAL) && x>=18&&x<=342&&y>=115&&y<=150){actions.onWifiSettings();return true;}
             // Dedicated top-right triple tap opens / closes parameter editor.
             // Changes only persist when the SAVE button is explicitly pressed.
             if((page==PAGE_VOICE||page==PAGE_TUNE) && x>=235 && x<=348 &&
