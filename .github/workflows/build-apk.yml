@@ -1,4 +1,4 @@
-name: REx Android v1.5 VAD neural parallel APK
+name: REx Android v1.6 WiFi APK
 on:
   workflow_dispatch:
   push:
@@ -40,6 +40,6 @@ jobs:
       - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: REX-v1.5-neural-parallel-debug-APK
+          name: REX-v1.6-wifi-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
