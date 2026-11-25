@@ -25,11 +25,13 @@ public final class MainActivity extends Activity implements RexView.Actions {
     private long voiceAllowedAt;
     private int linkGeneration;
     private String linkState="未连接";
+    private boolean bootWaiting;
+    private boolean receiptPending; private long receiptId;
     private AlertDialog voiceConfirm;
     private String wifiKey(){return getSharedPreferences("rex_wifi",MODE_PRIVATE).getString("key","");}
     private void refreshWifi(){if(view!=null)view.setIrStatus("WiFi "+linkState+" · 语音"+(voiceAllowed?"ON":"OFF")+" · 点击设置");}
     private void disarmVoice(){voiceAllowed=false; if(voiceConfirm!=null){voiceConfirm.dismiss();voiceConfirm=null;} refreshWifi();}
-    private void disconnectWifi(){++linkGeneration;wifiConnected=false;disarmVoice();if(wifi!=null){wifi.close();wifi=null;}linkState="未连接";refreshWifi();}
+    private void disconnectWifi(){++linkGeneration;wifiConnected=false;bootWaiting=false;if(receiptPending&&view!=null)view.setWifiReceipt("未收到回执：连接中断，执行结果未知");receiptPending=false;disarmVoice();if(wifi!=null){wifi.close();wifi=null;}linkState="未连接";refreshWifi();}
     private void connectWifi(){
         disconnectWifi();String key=wifiKey();
         if(!foreground||key.isEmpty()){linkState="点击配对";refreshWifi();return;}
@@ -37,12 +39,17 @@ public final class MainActivity extends Activity implements RexView.Actions {
         wifi=new WifiLink(this,key,new WifiLink.Listener(){
             public void status(boolean connected,String state){runOnUiThread(()->{
                 if(gen!=linkGeneration||!foreground)return;
-                wifiConnected=connected;linkState=state.equals("READY")?"PPO就绪":state.equals("CONNECTED")?"已连接":state.equals("FAULT")?"故障锁存":state.equals("WAIT_GRAPH")?"等待控制器":state;
-                if(!connected||state.equals("FAULT"))disarmVoice();refreshWifi();
+                wifiConnected=connected;bootWaiting=connected&&state.equals("BOOT_WAIT");
+                if(!connected&&receiptPending){view.setWifiReceipt("未收到回执：连接中断，执行结果未知");receiptPending=false;}
+                linkState=bootWaiting?"等待现场确认":state.equals("READY")?"PPO就绪":state.equals("CONNECTED")?"已连接":state.equals("FAULT")?"故障锁存":state.equals("WAIT_GRAPH")?"等待控制器":state;
+                if(!connected||state.equals("FAULT")||bootWaiting)disarmVoice();refreshWifi();
             });}
             public void reply(RexCommand cmd,String state){runOnUiThread(()->{
                 if(gen!=linkGeneration||!foreground)return;
-                view.setMessage(cmd.label+" · "+state+"（请求回执）");
+                receiptPending=false;
+                String result=receiptLabel(state);
+                view.setWifiReceipt((state.equals("BOOT_APPROVAL_EXPIRED")?"本机：":"NanoPC：")+cmd.label+" · "+result);
+                view.setMessage(cmd.label+" · "+result);
             });}
         });
     }
@@ -56,7 +63,7 @@ public final class MainActivity extends Activity implements RexView.Actions {
                     catch(IllegalArgumentException ex){view.setMessage("配对密钥格式错误");}
                 }).show();
             }else if(i==1){
-                if(!wifiConnected){view.setMessage("先连接机器人");return;}
+                if(!wifiConnected||bootWaiting){view.setMessage("先完成现场确认并启动控制器");return;}
                 new AlertDialog.Builder(this).setTitle("开启本次语音控制？").setMessage("个人口令模型不是身份认证，可能误识别。仅在现场试验条件满足、App前台时允许方向及动作口令。激活、站立、失能仍需确认。物理急停必须可用。")
                 .setNegativeButton("取消",null).setPositiveButton("开启",(a,b)->{if(foreground&&wifiConnected){voiceAllowed=true;voiceAllowedAt=SystemClock.elapsedRealtime();refreshWifi();}}).show();
             }else if(i==2){disarmVoice();sendWifi(RexCommand.STOP);}else connectWifi();
@@ -296,17 +303,39 @@ public final class MainActivity extends Activity implements RexView.Actions {
         if(voiceConfirm!=null)return;
         if(cmd==RexCommand.DISABLE||cmd==RexCommand.ACTIVE||cmd==RexCommand.STAND) {
             final int gen=linkGeneration;
+            final boolean boot=bootWaiting&&cmd==RexCommand.ACTIVE;
             final long confirmAt=SystemClock.elapsedRealtime();
-            voiceConfirm=new AlertDialog.Builder(this).setTitle("确认 WiFi 指令")
-                .setMessage("即将请求「"+cmd.label+"」。确认现场试验条件；失能可能导致倒下。")
+            voiceConfirm=new AlertDialog.Builder(this).setTitle(boot?"现场启动许可（不激活电机）":"确认 WiFi 指令")
+                .setMessage(boot?"仅限机器人现场操作。确认防坠支架已固定、物理急停可用、人员远离运动区域、实机增益已验收。确认仅启动原控制服务，不会自动激活或站立；服务就绪后须重新发激活指令。":"即将请求「"+cmd.label+"」。确认现场试验条件；失能可能导致倒下。")
                 .setNegativeButton("取消",null)
-                .setPositiveButton("发送",(dialog,which)->{if(gen==linkGeneration&&foreground&&wifiConnected&&SystemClock.elapsedRealtime()-confirmAt<=10000)sendWifi(cmd);else view.setMessage("确认已过期，请重新发送");})
+                .setPositiveButton("发送",(dialog,which)->{if(gen==linkGeneration&&foreground&&wifiConnected&&SystemClock.elapsedRealtime()-confirmAt<=10000&&boot== (bootWaiting&&cmd==RexCommand.ACTIVE))sendWifi(cmd,boot);else view.setMessage("确认已过期，请重新发送");})
                 .create();
             voiceConfirm.setOnDismissListener(d->voiceConfirm=null);voiceConfirm.show();
         } else sendWifi(cmd);
     }
-    private void sendWifi(RexCommand cmd){
-        if(foreground&&wifi!=null&&wifi.submit(cmd))view.setMessage("WiFi 请求："+cmd.label);
-        else view.setMessage("未发送：未连接或正在处理指令");
+    private void sendWifi(RexCommand cmd){sendWifi(cmd,false);}
+    private void sendWifi(RexCommand cmd,boolean boot){
+        if(foreground&&wifi!=null&&wifi.submit(cmd,boot)){
+            receiptPending=true;view.setWifiReceipt("等待 NanoPC 回执："+cmd.label);
+            view.setMessage("WiFi 请求："+cmd.label);
+            final int gen=linkGeneration;final long id=++receiptId;
+            view.postDelayed(()->{if(gen==linkGeneration&&id==receiptId&&receiptPending){receiptPending=false;view.setWifiReceipt("未收到回执：执行结果未知");}},1500);
+        }else view.setMessage("未发送：未连接或正在处理指令");
+    }
+    private static String receiptLabel(String s){
+        switch(s){
+            case "BOOT_START_REQUESTED":return "已收到 · 启动控制服务";
+            case "BOOT_WAIT_NO_MOTION":return "已收到 · 尚未现场确认";
+            case "BOOT_APPROVAL_EXPIRED":return "未发送 · 许可已过期";
+            case "STATE_QUERY_SENT":return "已收到 · 状态请求已发";
+            case "ZERO_REQUEST_SENT":return "已收到 · 零速请求已发";
+            case "DISABLE_REQUEST_SENT_NOT_ACK":return "已收到 · 失能请求已发";
+            case "WALK_PERMISSION_REQUESTED":return "已收到 · 等待行走许可";
+            case "STARTED":return "已收到 · 动作调度开始";
+            case "WAITING_FOR_GRAPH":return "已收到 · 控制器未就绪";
+            case "REJECTED_NOT_PPO_RUN_OR_HEALTHY":return "已收到 · 未就绪，拒绝移动";
+            case "BUSY_NO_QUEUE":return "已收到 · 忙，未排队";
+            default:return "已收到 · "+s;
+        }
     }
 }

@@ -71,6 +71,8 @@ public final class RexView extends View {
     private boolean enrollmentCapturing;
     private String message="v1.6 · WiFi 控制 · 点击顶部连接状态";
     private String irStatus="WiFi 未连接";
+    private String wifiReceipt="NanoPC：尚无指令回执";
+    public void setWifiReceipt(String value){wifiReceipt=value;invalidate();}
     private String lastText="请说 Rex / Rex醒了吗 / 灭建国";
     private String voiceStatus="语音未启动";
     private String commandText="";
@@ -365,7 +367,7 @@ public final class RexView extends View {
         text(c,shortText(irStatus,39),27,137,10,0xFFD3ADB7,false);
         box(c,17,712,343,764,0xBC16151D,12);
         text(c,shortText(message,44),26,734,10,0xFFF0C5CB,false);
-        text(c,"WiFi 双向请求回执 · 非电机动作完成确认",26,752,8,0xFF9D7581,false);
+        text(c,shortText(wifiReceipt,46),26,752,9,0xFF8CD9B2,false);
     }
     /** Each volume is an irregular particle mesh; no primitive sphere or orbit rings. */
     private void renderVolume(Canvas c,float seconds,boolean inner,float cx,float cy,

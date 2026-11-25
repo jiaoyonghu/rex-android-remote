@@ -20,7 +20,8 @@ final class WifiLink {
     private final Context context; private final Listener listener; private final byte[] key;
     private volatile boolean running=true, connected=false;
     private volatile Socket socket;
-    private RexCommand pending; private long pendingAt;
+    private RexCommand pending; private long pendingAt; private boolean pendingBoot;
+    private static final class Pending { final RexCommand cmd; final boolean boot; Pending(RexCommand c,boolean b){cmd=c;boot=b;} }
     private final Thread worker;
     WifiLink(Context ctx,String hex,Listener cb){
         context=ctx.getApplicationContext(); listener=cb; key=decode(hex);
@@ -36,15 +37,16 @@ final class WifiLink {
         StringBuilder s=new StringBuilder(64);for(byte v:b)s.append(String.format(java.util.Locale.ROOT,"%02x",v&255));return s.toString();
     }
     static boolean same(String a,String b){return MessageDigest.isEqual(a.getBytes(StandardCharsets.US_ASCII),b.getBytes(StandardCharsets.US_ASCII));}
-    synchronized boolean submit(RexCommand cmd){
+    synchronized boolean submit(RexCommand cmd){return submit(cmd,false);}
+    synchronized boolean submit(RexCommand cmd,boolean boot){
         if(!running||!connected||!RexCommand.isAction(cmd))return false;
         if(pending!=null && cmd!=RexCommand.STOP && cmd!=RexCommand.DISABLE)return false;
-        pending=cmd;pendingAt=SystemClock.elapsedRealtime();return true;
+        pending=cmd;pendingBoot=boot;pendingAt=SystemClock.elapsedRealtime();return true;
     }
-    private synchronized RexCommand take(){
-        RexCommand c=SystemClock.elapsedRealtime()-pendingAt<=350?pending:null;pending=null;return c;
+    private synchronized Pending take(){
+        RexCommand c=SystemClock.elapsedRealtime()-pendingAt<=350?pending:null;boolean b=pendingBoot;pending=null;pendingBoot=false;return c==null?null:new Pending(c,b);
     }
-    private synchronized void disconnected(){connected=false;pending=null;}
+    private synchronized void disconnected(){connected=false;pending=null;pendingBoot=false;}
     void close(){running=false;disconnected();Socket s=socket;if(s!=null)try{s.close();}catch(IOException ignored){}worker.interrupt();}
     private Socket open()throws IOException{
         ConnectivityManager cm=(ConnectivityManager)context.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -56,8 +58,9 @@ final class WifiLink {
                 if(!a.getAddress().getHostAddress().startsWith("10.42.0."))continue;
                 Socket s=n.getSocketFactory().createSocket();socket=s;
                 if(!running){s.close();throw new IOException("closed");}
-                s.connect(new InetSocketAddress("10.42.0.1",8765),800);
-                s.setSoTimeout(400);s.setTcpNoDelay(true);return s;
+                try{s.connect(new InetSocketAddress("10.42.0.1",8765),800);
+                    s.setSoTimeout(400);s.setTcpNoDelay(true);return s;}
+                catch(IOException e){s.close();throw e;}
             }
         }
         throw new IOException("请连接 REX_ROBOT");
@@ -75,7 +78,9 @@ final class WifiLink {
                 if(hello.length!=3||!hello[0].equals("REX1")||!hello[1].matches("[0-9a-f]{64}")||!same(hello[2],tag(key,"SERVER|"+hello[1])))throw new IOException("配对密钥错误");
                 String nonce=hello[1];long seq=0;String last="";
                 while(running){
-                    RexCommand cmd=take();String name=cmd==null?"PING":cmd.name();String data=(++seq)+"|"+name;
+                    Pending item=take();RexCommand cmd=item==null?null:item.cmd;
+                    if(item!=null && item.boot && !last.equals("BOOT_WAIT")){listener.reply(cmd,"BOOT_APPROVAL_EXPIRED");cmd=null;item=null;}
+                    String name=cmd==null?"PING":item.boot?"BOOT_APPROVE":cmd.name();String data=(++seq)+"|"+name;
                     out.write((data+"|"+tag(key,nonce+"|"+data)+"\n").getBytes(StandardCharsets.US_ASCII));out.flush();
                     String[] ack=line(in).split("\\|",-1);
                     if(ack.length!=3||!ack[0].equals(Long.toString(seq))||!same(ack[2],tag(key,nonce+"|ACK|"+ack[0]+"|"+ack[1])))throw new IOException("invalid ACK");
